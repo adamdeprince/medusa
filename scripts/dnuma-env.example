@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Example site configuration for scripts/ and tests/ (copy to .dnuma-env in
+# the source tree, or point DNUMA_ENV_FILE at your copy). One NAME=value per
+# line; quote values that contain spaces.
+
+# The slaves scripts/cluster.sh starts agents on, as name=address pairs. The
+# address must be reachable by ssh from the master (with sudo rights there)
+# and is also the agent's management address.
+DNUMA_SLAVES="node-b=192.0.2.10"
+
+# Extra arguments for the daemons scripts/cluster.sh starts. For example, a
+# slave that also does other work can offer only some of its NUMA nodes; the
+# agent and everything it hosts then stay on those nodes' CPUs and memory.
+#DNUMA_AGENT_ARGS="--nodes 1 --capacity 16G"
+#DNUMA_MASTER_ARGS="--auto-export"
+
+# The slave the tests attach, detach and break. Defaults to the first entry
+# of DNUMA_SLAVES.
+#DNUMA_SLAVE=node-b
+#DNUMA_SLAVE_ADDR=192.0.2.10
+
+# Address the slave's RDMA interface has, if different from DNUMA_SLAVE_ADDR.
+#DNUMA_SLAVE_RDMA_ADDR=198.51.100.10
+
+# The master's own address on the RDMA network (tests/integration/06 runs a
+# second agent on the master host). Default: the local address used to reach
+# the slave's RDMA address.
+#DNUMA_MASTER_RDMA_ADDR=198.51.100.1
+
+# An address nothing answers on, for "connect to a host that is not there".
+# Default: 192.0.2.1 (reserved for documentation, never assigned).
+#DNUMA_UNREACHABLE_ADDR=192.0.2.1
+
+# Only for scripts/sync.sh (developing on one machine, building on another):
+# the build host and the directory there, relative to the home directory.
+#DNUMA_BUILD_HOST=build-host
+#DNUMA_BUILD_PATH=src/dnuma

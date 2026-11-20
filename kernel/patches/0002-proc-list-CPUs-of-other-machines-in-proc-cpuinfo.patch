@@ -1,0 +1,159 @@
+From eea29a356d3947bdcd56dddc497965281a31eb56 Mon Sep 17 00:00:00 2001
+From: Adam DePrince <adam.deprince@gmail.com>
+Date: Fri, 20 Nov 2026 17:34:28 -0500
+Subject: [RFC PATCH 2/5] proc: list CPUs of other machines in /proc/cpuinfo
+
+Append the CPUs a manager described through /proc/dnuma_view to
+/proc/cpuinfo, after the machine's own. Each block is printed as the
+manager wrote it, which is expected to be the text the other machine's
+kernel prints for that CPU with the processor number replaced.
+
+This is done with a seq_file iterator that wraps the architecture's
+cpuinfo_op: positions below nr_cpu_ids go to the architecture, the ones
+from nr_cpu_ids up are remote CPUs, walked under RCU. With no manager the
+list is empty and the output is unchanged.
+
+Assisted-by: Claude Fable 5.2
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018DNkjq1BzRe4hiXNhh3ctv
+---
+ fs/proc/cpuinfo.c          |  3 +-
+ fs/proc/dnuma_view.c       | 87 ++++++++++++++++++++++++++++++++++++++
+ include/linux/dnuma_view.h |  3 ++
+ 3 files changed, 92 insertions(+), 1 deletion(-)
+
+diff --git a/fs/proc/cpuinfo.c b/fs/proc/cpuinfo.c
+index f38bda5b8..f982d9a45 100644
+--- a/fs/proc/cpuinfo.c
++++ b/fs/proc/cpuinfo.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/cpufreq.h>
++#include <linux/dnuma_view.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
+ #include <linux/proc_fs.h>
+@@ -9,7 +10,7 @@ extern const struct seq_operations cpuinfo_op;
+ 
+ static int cpuinfo_open(struct inode *inode, struct file *file)
+ {
+-	return seq_open(file, &cpuinfo_op);
++	return seq_open(file, IS_ENABLED(CONFIG_DNUMA_VIEW) ? &dnuma_view_cpuinfo_op : &cpuinfo_op);
+ }
+ 
+ static const struct proc_ops cpuinfo_proc_ops = {
+diff --git a/fs/proc/dnuma_view.c b/fs/proc/dnuma_view.c
+index 777071949..a93bea41c 100644
+--- a/fs/proc/dnuma_view.c
++++ b/fs/proc/dnuma_view.c
+@@ -103,6 +103,93 @@ static DEFINE_HASHTABLE(dv_tasks, 8);
+ static unsigned int dv_nr_tasks;
+ static struct file *dv_writer;
+ 
++/* ---- readers ---------------------------------------------------------- */
++
++/*
++ * /proc/cpuinfo. The position is a CPU number throughout: the architecture's
++ * iterator handles the numbers below nr_cpu_ids, this one the remote CPUs,
++ * which are all numbered from nr_cpu_ids up. m->private (unused by
++ * seq_open()) records which of the two a start()/stop() bracket is in; the
++ * remote part runs under RCU.
++ */
++extern const struct seq_operations cpuinfo_op;
++
++static struct dv_cpu *dv_cpu_from(loff_t *pos)
++{
++	struct dv_cpu *c;
++
++	list_for_each_entry_rcu(c, &dv_cpus, list) {
++		if (c->id >= *pos) {
++			*pos = c->id;
++			return c;
++		}
++	}
++	return NULL;
++}
++
++static void *dv_ci_remote_start(struct seq_file *m, loff_t *pos)
++{
++	m->private = (void *)1UL;
++	rcu_read_lock();
++	return dv_cpu_from(pos);
++}
++
++static void *dv_ci_start(struct seq_file *m, loff_t *pos)
++{
++	if (*pos < nr_cpu_ids) {
++		void *v = cpuinfo_op.start(m, pos);
++
++		if (v) {
++			m->private = NULL;
++			return v;
++		}
++		cpuinfo_op.stop(m, NULL);
++		*pos = nr_cpu_ids;
++	}
++	return dv_ci_remote_start(m, pos);
++}
++
++static void *dv_ci_next(struct seq_file *m, void *v, loff_t *pos)
++{
++	if (m->private) {
++		++*pos;
++		return dv_cpu_from(pos);
++	}
++	v = cpuinfo_op.next(m, v, pos);
++	if (v)
++		return v;
++	cpuinfo_op.stop(m, NULL);
++	*pos = nr_cpu_ids;
++	return dv_ci_remote_start(m, pos);
++}
++
++static void dv_ci_stop(struct seq_file *m, void *v)
++{
++	if (m->private) {
++		rcu_read_unlock();
++		m->private = NULL;
++	} else {
++		cpuinfo_op.stop(m, v);
++	}
++}
++
++static int dv_ci_show(struct seq_file *m, void *v)
++{
++	struct dv_cpu *c = v;
++
++	if (!m->private)
++		return cpuinfo_op.show(m, v);
++	seq_write(m, c->info, c->info_len);
++	return 0;
++}
++
++const struct seq_operations dnuma_view_cpuinfo_op = {
++	.start	= dv_ci_start,
++	.next	= dv_ci_next,
++	.stop	= dv_ci_stop,
++	.show	= dv_ci_show,
++};
++
+ /* ---- the writer (dv_lock held) ----------------------------------------- */
+ 
+ static struct dv_cpu *dv_find_cpu(unsigned int id)
+diff --git a/include/linux/dnuma_view.h b/include/linux/dnuma_view.h
+index 70317c824..677c0a739 100644
+--- a/include/linux/dnuma_view.h
++++ b/include/linux/dnuma_view.h
+@@ -13,6 +13,9 @@
+ /* Fields of a "cpuN" line of /proc/stat, in the order they are printed. */
+ #define DNUMA_VIEW_NSTAT 10
+ 
++/* /proc/cpuinfo iterator that appends the remote CPUs to the machine's own. */
++extern const struct seq_operations dnuma_view_cpuinfo_op;
++
+ #ifdef CONFIG_DNUMA_VIEW
+ 
+ /* True while a manager holds /proc/dnuma_view open for writing. */
+-- 
+2.34.1
+

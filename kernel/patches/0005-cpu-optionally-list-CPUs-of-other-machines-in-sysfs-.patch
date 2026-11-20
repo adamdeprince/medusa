@@ -1,0 +1,251 @@
+From 2ac4d4af4f4b04e1140771a662a8dd35e8bb454b Mon Sep 17 00:00:00 2001
+From: Adam DePrince <adam.deprince@gmail.com>
+Date: Fri, 20 Nov 2026 17:34:29 -0500
+Subject: [RFC PATCH 5/5] cpu: optionally list CPUs of other machines in sysfs
+ "online"
+
+Add an "online on|off" command to /proc/dnuma_view. While it is on,
+/sys/devices/system/cpu/online lists the remote CPUs after the machine's
+own; the control file reports the setting in an "online" line.
+
+This is separate from the rest of the view, and optional, because it
+reaches further. The C library takes the number of online processors
+(sysconf(_SC_NPROCESSORS_ONLN)) from this file, so with the setting on
+
+  - tools that show only that many per-CPU rows, such as top from
+    procps 3.x, show the remote CPUs, which is the reason for the
+    setting; but
+  - every program that sizes a thread or process pool by that number
+    starts more workers than this machine has CPUs.
+
+Nothing else in sysfs changes: there are no cpuN directories for the
+remote CPUs, and "possible" and "present" are untouched, as are the
+scheduler's masks and sched_getaffinity().
+
+A manager can tell from the absence of the "online" line that a kernel
+has the view without this patch.
+
+Assisted-by: Claude Fable 5.2
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018DNkjq1BzRe4hiXNhh3ctv
+---
+ drivers/base/cpu.c         |  7 ++++-
+ fs/proc/Kconfig            |  5 ++--
+ fs/proc/dnuma_view.c       | 56 ++++++++++++++++++++++++++++++++++----
+ include/linux/dnuma_view.h | 13 +++++++++
+ 4 files changed, 73 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/base/cpu.c b/drivers/base/cpu.c
+index 69e52fed4..0fd4f23ec 100644
+--- a/drivers/base/cpu.c
++++ b/drivers/base/cpu.c
+@@ -17,6 +17,7 @@
+ #include <linux/acpi.h>
+ #include <linux/of.h>
+ #include <linux/cpufeature.h>
++#include <linux/dnuma_view.h>
+ #include <linux/tick.h>
+ #include <linux/pm_qos.h>
+ #include <linux/delay.h>
+@@ -217,8 +218,12 @@ static ssize_t show_cpus_attr(struct device *dev,
+ 			      char *buf)
+ {
+ 	struct cpu_attr *ca = container_of(attr, struct cpu_attr, attr);
++	ssize_t len = sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(ca->map));
+ 
+-	return sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(ca->map));
++	/* "online" may also list CPUs of other machines (fs/proc/dnuma_view.c). */
++	if (ca->map == &__cpu_online_mask)
++		len = dnuma_view_emit_online(buf, len);
++	return len;
+ }
+ 
+ #define _CPU_ATTR(name, map) \
+diff --git a/fs/proc/Kconfig b/fs/proc/Kconfig
+index bb799fd9c..77be47b99 100644
+--- a/fs/proc/Kconfig
++++ b/fs/proc/Kconfig
+@@ -129,7 +129,7 @@ config PROC_CPU_RESCTRL
+ 
+ config DNUMA_VIEW
+ 	bool "Show CPUs of other machines and the work done on them in /proc"
+-	depends on PROC_FS && X86_64
++	depends on PROC_FS && SYSFS && X86_64
+ 	help
+ 	  Lets a cluster manager that moves the execution of local processes
+ 	  to other machines (dnuma-master) describe those machines' CPUs and
+@@ -137,7 +137,8 @@ config DNUMA_VIEW
+ 	  /proc/stat then list the remote CPUs after the local ones, and
+ 	  /proc/<pid>/stat reports the remote CPU, the running state and the
+ 	  remote CPU time of such a process, so that tools like top show
+-	  where the work is being done.
++	  where the work is being done. On request the remote CPUs are also
++	  listed in /sys/devices/system/cpu/online.
+ 
+ 	  This only changes what those files show. The scheduler, CPU masks,
+ 	  affinity and the kernel's own time accounting are not affected, and
+diff --git a/fs/proc/dnuma_view.c b/fs/proc/dnuma_view.c
+index c20300924..b052b937b 100644
+--- a/fs/proc/dnuma_view.c
++++ b/fs/proc/dnuma_view.c
+@@ -14,10 +14,15 @@
+  *   /proc/stat         has a "cpuN" line for each (and counts them in "cpu"),
+  *   /proc/<pid>/stat   reports the remote CPU, the running state and the CPU
+  *                      time consumed remotely (and /proc/<pid>/status the
+- *                      state).
++ *                      state),
+  *
+- * Nothing else changes: the scheduler, the CPU masks, affinity and sysfs
+- * know only the machine's own CPUs, and the kernel's own accounting
++ * and, if the manager asks for it, /sys/devices/system/cpu/online lists the
++ * remote CPUs too. That file is where the C library takes the number of
++ * online processors from, so programs that size themselves by that number
++ * (and tools that trust it more than /proc/stat) then count the remote CPUs.
++ *
++ * Nothing else changes: the scheduler, the CPU masks, affinity and the rest
++ * of sysfs know only the machine's own CPUs, and the kernel's own accounting
+  * (getrusage(), wait4(), cgroups) contains only what ran here.
+  *
+  * Control file: /proc/dnuma_view, mode 0600.
+@@ -27,6 +32,7 @@
+  *           user_hz <n>         unit of all times written here
+  *           cpus <n>
+  *           tasks <n>
++ *           online <0|1>        remote CPUs are listed in sysfs "online"
+  *
+  *   write   commands, one per line; a write must hold whole commands:
+  *
+@@ -43,6 +49,7 @@
+  *                                    remotely. Ignored if no such task
+  *                                    exists (any more).
+  *           task <pid> del
++ *           online <on|off>
+  *           clear
+  *
+  * Commands are applied in order; at the first invalid one the write fails
+@@ -66,6 +73,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
++#include <linux/sysfs.h>
+ #include <linux/uaccess.h>
+ 
+ /*
+@@ -101,6 +109,7 @@ static LIST_HEAD(dv_cpus);
+ static unsigned int dv_nr_cpus;
+ static DEFINE_HASHTABLE(dv_tasks, 8);
+ static unsigned int dv_nr_tasks;
++static bool dv_online;
+ static struct file *dv_writer;
+ 
+ /* ---- readers ---------------------------------------------------------- */
+@@ -154,6 +163,37 @@ void __dnuma_view_task(struct pid *pid, struct dnuma_view_task *out)
+ 	rcu_read_unlock();
+ }
+ 
++ssize_t __dnuma_view_emit_online(char *buf, ssize_t len)
++{
++	unsigned int first = 0, last = 0;
++	bool open = false;
++	struct dv_cpu *c;
++
++	if (!READ_ONCE(dv_online) || len <= 0)
++		return len;
++	if (buf[len - 1] == '\n')
++		len--;
++	/* The list is sorted: emit each run of consecutive numbers as a range. */
++	rcu_read_lock();
++	list_for_each_entry_rcu(c, &dv_cpus, list) {
++		if (open && c->id == last + 1) {
++			last = c->id;
++			continue;
++		}
++		if (open)
++			len += first == last ? sysfs_emit_at(buf, len, ",%u", first) :
++					       sysfs_emit_at(buf, len, ",%u-%u", first, last);
++		first = last = c->id;
++		open = true;
++	}
++	rcu_read_unlock();
++	if (open)
++		len += first == last ? sysfs_emit_at(buf, len, ",%u", first) :
++				       sysfs_emit_at(buf, len, ",%u-%u", first, last);
++	len += sysfs_emit_at(buf, len, "\n");
++	return len;
++}
++
+ /*
+  * /proc/cpuinfo. The position is a CPU number throughout: the architecture's
+  * iterator handles the numbers below nr_cpu_ids, this one the remote CPUs,
+@@ -419,6 +459,10 @@ static int dv_command(const char *line, const char **rest, const char *end)
+ 		dv_clear();
+ 		return 0;
+ 	}
++	if (!strcmp(line, "online on") || !strcmp(line, "online off")) {
++		WRITE_ONCE(dv_online, line[8] == 'n');
++		return 0;
++	}
+ 
+ 	n = 0;
+ 	if (sscanf(line, "cpu %u info %zu%n", &id, &len, &n) == 2 && n && !line[n]) {
+@@ -515,8 +559,9 @@ static ssize_t dv_write(struct file *file, const char __user *ubuf, size_t count
+ 
+ static int dv_show(struct seq_file *m, void *v)
+ {
+-	seq_printf(m, "version 1\nnr_cpu_ids %u\nuser_hz %d\ncpus %u\ntasks %u\n",
+-		   nr_cpu_ids, USER_HZ, READ_ONCE(dv_nr_cpus), READ_ONCE(dv_nr_tasks));
++	seq_printf(m, "version 1\nnr_cpu_ids %u\nuser_hz %d\ncpus %u\ntasks %u\nonline %d\n",
++		   nr_cpu_ids, USER_HZ, READ_ONCE(dv_nr_cpus), READ_ONCE(dv_nr_tasks),
++		   READ_ONCE(dv_online));
+ 	return 0;
+ }
+ 
+@@ -546,6 +591,7 @@ static int dv_release(struct inode *inode, struct file *file)
+ 	mutex_lock(&dv_lock);
+ 	if (file == dv_writer) {
+ 		dv_clear();
++		WRITE_ONCE(dv_online, false);
+ 		dv_writer = NULL;
+ 		static_branch_disable(&dnuma_view_key);
+ 	}
+diff --git a/include/linux/dnuma_view.h b/include/linux/dnuma_view.h
+index 2d6d77fdc..414f3b033 100644
+--- a/include/linux/dnuma_view.h
++++ b/include/linux/dnuma_view.h
+@@ -40,6 +40,7 @@ unsigned int __dnuma_view_nr_cpus(void);
+ void __dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT]);
+ void __dnuma_view_stat_show(struct seq_file *p);
+ void __dnuma_view_task(struct pid *pid, struct dnuma_view_task *out);
++ssize_t __dnuma_view_emit_online(char *buf, ssize_t len);
+ 
+ /* Number of remote CPUs currently shown. */
+ static inline unsigned int dnuma_view_nr_cpus(void)
+@@ -74,6 +75,17 @@ static inline void dnuma_view_task(struct pid *pid, struct dnuma_view_task *out)
+ 		__dnuma_view_task(pid, out);
+ }
+ 
++/*
++ * @buf holds the @len bytes of /sys/devices/system/cpu/online. Appends the
++ * remote CPUs if the manager asked for that; returns the new length.
++ */
++static inline ssize_t dnuma_view_emit_online(char *buf, ssize_t len)
++{
++	if (static_branch_unlikely(&dnuma_view_key))
++		return __dnuma_view_emit_online(buf, len);
++	return len;
++}
++
+ #else /* !CONFIG_DNUMA_VIEW */
+ 
+ static inline unsigned int dnuma_view_nr_cpus(void) { return 0; }
+@@ -86,6 +98,7 @@ static inline void dnuma_view_task(struct pid *pid, struct dnuma_view_task *out)
+ 	out->utime = 0;
+ 	out->stime = 0;
+ }
++static inline ssize_t dnuma_view_emit_online(char *buf, ssize_t len) { return len; }
+ 
+ #endif /* CONFIG_DNUMA_VIEW */
+ 
+-- 
+2.34.1
+

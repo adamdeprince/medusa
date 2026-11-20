@@ -1,0 +1,95 @@
+From 2ac4d4af4f4b04e1140771a662a8dd35e8bb454b Mon Sep 17 00:00:00 2001
+From: Adam DePrince <adam.deprince@gmail.com>
+Date: Fri, 20 Nov 2026 17:40:57 -0500
+Subject: [RFC PATCH 0/5] proc: show CPUs of other machines and the work done on them (dnuma view)
+
+dnuma (https://github.com/adamdeprince/medusa) runs the user code of
+ordinary, unmodified processes on the CPUs of other machines. The process
+itself never leaves: it keeps its pid, files, terminal and place in the
+process tree on the machine it was started on (the master), which executes
+every system call for it, and it sleeps there while its code runs
+elsewhere. All of that is done in user space with ptrace, userfaultfd and
+RDMA, on stock kernels.
+
+What user space cannot do is make this visible. top shows such a process
+as idle, and the CPUs it is using are not listed anywhere. This series
+lets the manager describe both to the master's kernel, which then shows
+them in the files tools already read:
+
+  /proc/cpuinfo                   remote CPUs listed after the local ones
+  /proc/stat                      a cpuN line for each, counted in "cpu"
+  /proc/<pid>/stat and status     remote CPU, running state, CPU time
+  /sys/devices/system/cpu/online  remote CPUs too, if asked (patch 5)
+
+It is display only. No CPU mask, scheduler structure or accounting field
+is touched; remote CPUs are numbered from nr_cpu_ids up; every hook is
+behind one static key that is off unless a manager has the control file
+open; and what a manager wrote is dropped when it closes the file or dies.
+
+This is an RFC and is not proposed for merging in this form. Listing CPUs
+the scheduler does not have is acceptable for a system that is explicit
+about it, not obviously as a general kernel feature, and patch 5 changes
+what the C library reports as the number of online processors. Patch 5 is
+last so that it can be left out; dnuma-master detects its absence.
+
+Patches:
+
+  1  the control file and the state behind it (nothing shown yet)
+  2  /proc/cpuinfo
+  3  /proc/stat
+  4  /proc/<pid>/stat and /proc/<pid>/status
+  5  /sys/devices/system/cpu/online (optional)
+
+Applies to v7.3.5. CONFIG_DNUMA_VIEW, x86-64, default off.
+
+Origin of the code. The patches, their changelogs and the tests were
+written by an AI coding assistant (Claude) working at the direction of
+the submitter, who should be asked about intent and design. The commits
+carry Assisted-by tags and no Signed-off-by: nobody has yet certified the
+Developer's Certificate of Origin for them.
+
+Testing.
+
+  - Each commit builds without warnings (W=1 for the touched directories)
+    with CONFIG_DNUMA_VIEW on and off.
+  - A 4-CPU KVM guest boots the result with a test as init (kernel/test in
+    the dnuma repository): 53 checks of the control file, /proc/cpuinfo,
+    /proc/stat, /proc/<pid>/stat and status, sysfs "online", the ps and
+    top binaries of procps 3.3.17, 1500 rounds of concurrent readers
+    against a writer adding and removing CPUs, and cleanup on close. They
+    pass on a production configuration and on one with PROVE_LOCKING,
+    PROVE_RCU, KASAN, DEBUG_ATOMIC_SLEEP and DEBUG_LIST, with nothing in
+    the kernel log.
+  - On real hardware: a 96-CPU master running this kernel with one
+    machine attached that offers 24 CPUs. dnuma's test suite passes there,
+    including a test that follows the chain from the other machine's
+    counters to what top prints.
+
+Not tested: architectures other than x86-64, CPU hotplug or suspend while
+a view exists, long uptimes, and the series with patch 5 left out (it
+builds; it has not been run).
+
+Adam DePrince (5):
+  proc: add /proc/dnuma_view, a description of CPUs and work on other
+    machines
+  proc: list CPUs of other machines in /proc/cpuinfo
+  proc: show CPUs of other machines in /proc/stat
+  proc: show where a task executing on another machine runs and what it
+    uses
+  cpu: optionally list CPUs of other machines in sysfs "online"
+
+ drivers/base/cpu.c         |   7 +-
+ fs/proc/Kconfig            |  19 ++
+ fs/proc/Makefile           |   1 +
+ fs/proc/array.c            |  17 +-
+ fs/proc/cpuinfo.c          |   3 +-
+ fs/proc/dnuma_view.c       | 616 +++++++++++++++++++++++++++++++++++++
+ fs/proc/stat.c             |  27 +-
+ include/linux/dnuma_view.h | 117 +++++++
+ 8 files changed, 790 insertions(+), 17 deletions(-)
+ create mode 100644 fs/proc/dnuma_view.c
+ create mode 100644 include/linux/dnuma_view.h
+
+-- 
+2.34.1
+

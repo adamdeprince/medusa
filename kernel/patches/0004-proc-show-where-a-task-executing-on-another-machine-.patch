@@ -1,0 +1,205 @@
+From 8939628cd0d60cca77ac86bf8e5f4958e6a040e0 Mon Sep 17 00:00:00 2001
+From: Adam DePrince <adam.deprince@gmail.com>
+Date: Fri, 20 Nov 2026 17:34:29 -0500
+Subject: [RFC PATCH 4/5] proc: show where a task executing on another machine
+ runs and what it uses
+
+For a task the manager described through /proc/dnuma_view,
+
+  /proc/<pid>/stat    reports the remote CPU in the "processor" field,
+                      state R instead of S while the manager says the
+                      task is running remotely, and utime/stime
+                      including the time consumed remotely;
+  /proc/<pid>/status  reports the same state.
+
+Only a sleeping task is shown as running: any other state it has here
+(running, stopped, traced, uninterruptible) is the more specific truth
+and is left alone. This is what makes top and ps show such a task as
+busy on a CPU of the other machine rather than as idle.
+
+The kernel's own accounting is not touched: getrusage(), wait4() and
+cgroup CPU accounting contain only the time the task ran on this machine.
+
+Assisted-by: Claude Fable 5.2
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018DNkjq1BzRe4hiXNhh3ctv
+---
+ fs/proc/array.c            | 17 +++++++++++----
+ fs/proc/dnuma_view.c       | 17 +++++++++++++++
+ include/linux/dnuma_view.h | 44 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 74 insertions(+), 4 deletions(-)
+
+diff --git a/fs/proc/array.c b/fs/proc/array.c
+index f6f75d206..b3ed03a95 100644
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@ -53,6 +53,7 @@
+  *			 :  base.c too.
+  */
+ 
++#include <linux/dnuma_view.h>
+ #include <linux/types.h>
+ #include <linux/errno.h>
+ #include <linux/hex.h>
+@@ -178,7 +179,7 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
+ 	if (umask >= 0)
+ 		seq_printf(m, "Umask:\t%#04o\n", umask);
+ 	seq_puts(m, "State:\t");
+-	seq_puts(m, get_task_state(p));
++	seq_puts(m, dnuma_view_task_state(pid, get_task_state(p)));
+ 
+ 	seq_put_decimal_ull(m, "\nTgid:\t", tgid);
+ 	seq_put_decimal_ull(m, "\nNgid:\t", ngid);
+@@ -482,6 +483,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
+ 	unsigned long flags;
+ 	int exit_code = task->exit_code;
+ 	struct signal_struct *sig = task->signal;
++	struct dnuma_view_task remote;
+ 	int ret;
+ 
+ 	ret = down_read_killable(&task->signal->exec_update_lock);
+@@ -489,6 +491,13 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
+ 		return ret;
+ 
+ 	state = *get_task_state(task);
++	/*
++	 * A task whose code is executing on another machine sleeps here; show
++	 * what it is doing there instead.
++	 */
++	dnuma_view_task(pid, &remote);
++	if (remote.running && state == 'S')
++		state = 'R';
+ 	vsize = eip = esp = 0;
+ 	permitted = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS | PTRACE_MODE_NOAUDIT);
+ 	mm = get_task_mm(task);
+@@ -600,8 +609,8 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
+ 	seq_put_decimal_ull(m, " ", cmin_flt);
+ 	seq_put_decimal_ull(m, " ", maj_flt);
+ 	seq_put_decimal_ull(m, " ", cmaj_flt);
+-	seq_put_decimal_ull(m, " ", nsec_to_clock_t(utime));
+-	seq_put_decimal_ull(m, " ", nsec_to_clock_t(stime));
++	seq_put_decimal_ull(m, " ", nsec_to_clock_t(utime) + remote.utime);
++	seq_put_decimal_ull(m, " ", nsec_to_clock_t(stime) + remote.stime);
+ 	seq_put_decimal_ll(m, " ", nsec_to_clock_t(cutime));
+ 	seq_put_decimal_ll(m, " ", nsec_to_clock_t(cstime));
+ 	seq_put_decimal_ll(m, " ", priority);
+@@ -638,7 +647,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
+ 	seq_put_decimal_ull(m, " ", 0);
+ 	seq_put_decimal_ull(m, " ", 0);
+ 	seq_put_decimal_ll(m, " ", task->exit_signal);
+-	seq_put_decimal_ll(m, " ", task_cpu(task));
++	seq_put_decimal_ll(m, " ", remote.cpu >= 0 ? remote.cpu : task_cpu(task));
+ 	seq_put_decimal_ull(m, " ", task->rt_priority);
+ 	seq_put_decimal_ull(m, " ", task->policy);
+ 	seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task));
+diff --git a/fs/proc/dnuma_view.c b/fs/proc/dnuma_view.c
+index 59c9d34db..c20300924 100644
+--- a/fs/proc/dnuma_view.c
++++ b/fs/proc/dnuma_view.c
+@@ -137,6 +137,23 @@ void __dnuma_view_stat_show(struct seq_file *p)
+ 	rcu_read_unlock();
+ }
+ 
++void __dnuma_view_task(struct pid *pid, struct dnuma_view_task *out)
++{
++	struct dv_task *t;
++
++	rcu_read_lock();
++	hash_for_each_possible_rcu(dv_tasks, t, node, (unsigned long)pid) {
++		if (t->pid != pid)
++			continue;
++		out->cpu = READ_ONCE(t->cpu);
++		out->running = READ_ONCE(t->running);
++		out->utime = READ_ONCE(t->utime);
++		out->stime = READ_ONCE(t->stime);
++		break;
++	}
++	rcu_read_unlock();
++}
++
+ /*
+  * /proc/cpuinfo. The position is a CPU number throughout: the architecture's
+  * iterator handles the numbers below nr_cpu_ids, this one the remote CPUs,
+diff --git a/include/linux/dnuma_view.h b/include/linux/dnuma_view.h
+index 0dcfdb90a..2d6d77fdc 100644
+--- a/include/linux/dnuma_view.h
++++ b/include/linux/dnuma_view.h
+@@ -10,11 +10,24 @@
+ #include <linux/jump_label.h>
+ #include <linux/types.h>
+ 
++struct pid;
+ struct seq_file;
+ 
+ /* Fields of a "cpuN" line of /proc/stat, in the order they are printed. */
+ #define DNUMA_VIEW_NSTAT 10
+ 
++/*
++ * What /proc shows differently for a task that is executing on another
++ * machine. Times are in clock ticks (USER_HZ) and are added to the task's
++ * own.
++ */
++struct dnuma_view_task {
++	int cpu;	/* CPU number to report, or -1 for the task's own */
++	bool running;	/* report "running" while the task sleeps here */
++	u64 utime;
++	u64 stime;
++};
++
+ /* /proc/cpuinfo iterator that appends the remote CPUs to the machine's own. */
+ extern const struct seq_operations dnuma_view_cpuinfo_op;
+ 
+@@ -26,6 +39,7 @@ DECLARE_STATIC_KEY_FALSE(dnuma_view_key);
+ unsigned int __dnuma_view_nr_cpus(void);
+ void __dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT]);
+ void __dnuma_view_stat_show(struct seq_file *p);
++void __dnuma_view_task(struct pid *pid, struct dnuma_view_task *out);
+ 
+ /* Number of remote CPUs currently shown. */
+ static inline unsigned int dnuma_view_nr_cpus(void)
+@@ -49,12 +63,42 @@ static inline void dnuma_view_stat_show(struct seq_file *p)
+ 		__dnuma_view_stat_show(p);
+ }
+ 
++/* Fills @out for the task identified by @pid (neutral values if none). */
++static inline void dnuma_view_task(struct pid *pid, struct dnuma_view_task *out)
++{
++	out->cpu = -1;
++	out->running = false;
++	out->utime = 0;
++	out->stime = 0;
++	if (static_branch_unlikely(&dnuma_view_key))
++		__dnuma_view_task(pid, out);
++}
++
+ #else /* !CONFIG_DNUMA_VIEW */
+ 
+ static inline unsigned int dnuma_view_nr_cpus(void) { return 0; }
+ static inline void dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT]) { }
+ static inline void dnuma_view_stat_show(struct seq_file *p) { }
++static inline void dnuma_view_task(struct pid *pid, struct dnuma_view_task *out)
++{
++	out->cpu = -1;
++	out->running = false;
++	out->utime = 0;
++	out->stime = 0;
++}
+ 
+ #endif /* CONFIG_DNUMA_VIEW */
+ 
++/*
++ * The state string for /proc/<pid>/status: a task that sleeps here while its
++ * code runs on another machine is running.
++ */
++static inline const char *dnuma_view_task_state(struct pid *pid, const char *state)
++{
++	struct dnuma_view_task remote;
++
++	dnuma_view_task(pid, &remote);
++	return remote.running && state[0] == 'S' ? "R (running)" : state;
++}
++
+ #endif /* _LINUX_DNUMA_VIEW_H */
+-- 
+2.34.1
+

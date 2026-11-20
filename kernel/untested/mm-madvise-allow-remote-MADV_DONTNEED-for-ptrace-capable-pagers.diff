@@ -1,0 +1,46 @@
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -28,6 +28,7 @@
+ #include <linux/blk_plug.h>
+ #include <linux/backing-dev.h>
+ #include <linux/pagewalk.h>
++#include <linux/ptrace.h>
+ #include <linux/swap.h>
+ #include <linux/leafops.h>
+ #include <linux/shmem_fs.h>
+@@ -1587,6 +1588,13 @@
+ 	case MADV_WILLNEED:
+ 	case MADV_COLLAPSE:
+ 		return true;
++	case MADV_DONTNEED:
++		/*
++		 * Destructive: the target loses the contents of the range.
++		 * process_madvise() applies an additional ptrace-attach
++		 * permission check before allowing it on a remote mm.
++		 */
++		return true;
+ 	default:
+ 		return false;
+ 	}
+@@ -2158,6 +2166,21 @@
+ 		ret = -EPERM;
+ 		goto release_mm;
+ 	}
++
++	/*
++	 * Discarding another process's memory is as intrusive as rewriting
++	 * it, so hold the caller to the same standard as PTRACE_ATTACH. This
++	 * lets a privileged external pager (one that resolves the target's
++	 * userfaultfd faults) revoke a page it previously supplied, without
++	 * depending on the target's cooperation: the PTEs are removed and
++	 * the TLBs flushed before the call returns, and the next access
++	 * raises a missing-page fault to the pager.
++	 */
++	if (mm != current->mm && behavior == MADV_DONTNEED &&
++	    !ptrace_may_access(task, PTRACE_MODE_ATTACH_REALCREDS)) {
++		ret = -EPERM;
++		goto release_mm;
++	}
+ 
+ 	ret = vector_madvise(mm, &iter, behavior);
+ 

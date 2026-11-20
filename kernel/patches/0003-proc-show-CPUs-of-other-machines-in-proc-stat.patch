@@ -1,0 +1,186 @@
+From ab731e5c0589f54a3e8767ff0e0c41aa9ff9638d Mon Sep 17 00:00:00 2001
+From: Adam DePrince <adam.deprince@gmail.com>
+Date: Fri, 20 Nov 2026 17:34:29 -0500
+Subject: [RFC PATCH 3/5] proc: show CPUs of other machines in /proc/stat
+
+Print a "cpuN" line for every CPU described through /proc/dnuma_view,
+after the lines of the machine's own CPUs, with the counters the manager
+last wrote for it, and add those counters to the "cpu" total so that the
+total remains the sum of the lines below it.
+
+The remote counters are in clock ticks, as written; nothing is converted
+or extrapolated here. Both additions are behind the view's static key and
+cost nothing while no manager has the control file open.
+
+Assisted-by: Claude Fable 5.2
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018DNkjq1BzRe4hiXNhh3ctv
+---
+ fs/proc/dnuma_view.c       | 32 ++++++++++++++++++++++++++++++++
+ fs/proc/stat.c             | 27 ++++++++++++++++-----------
+ include/linux/dnuma_view.h | 34 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 82 insertions(+), 11 deletions(-)
+
+diff --git a/fs/proc/dnuma_view.c b/fs/proc/dnuma_view.c
+index a93bea41c..59c9d34db 100644
+--- a/fs/proc/dnuma_view.c
++++ b/fs/proc/dnuma_view.c
+@@ -105,6 +105,38 @@ static struct file *dv_writer;
+ 
+ /* ---- readers ---------------------------------------------------------- */
+ 
++unsigned int __dnuma_view_nr_cpus(void)
++{
++	return READ_ONCE(dv_nr_cpus);
++}
++
++void __dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT])
++{
++	struct dv_cpu *c;
++	int i;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(c, &dv_cpus, list)
++		for (i = 0; i < DNUMA_VIEW_NSTAT; i++)
++			sum[i] += READ_ONCE(c->stat[i]);
++	rcu_read_unlock();
++}
++
++void __dnuma_view_stat_show(struct seq_file *p)
++{
++	struct dv_cpu *c;
++	int i;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(c, &dv_cpus, list) {
++		seq_printf(p, "cpu%u", c->id);
++		for (i = 0; i < DNUMA_VIEW_NSTAT; i++)
++			seq_put_decimal_ull(p, " ", READ_ONCE(c->stat[i]));
++		seq_putc(p, '\n');
++	}
++	rcu_read_unlock();
++}
++
+ /*
+  * /proc/cpuinfo. The position is a CPU number throughout: the architecture's
+  * iterator handles the numbers below nr_cpu_ids, this one the remote CPUs,
+diff --git a/fs/proc/stat.c b/fs/proc/stat.c
+index 79b42f2bf..f4e3a0ecc 100644
+--- a/fs/proc/stat.c
++++ b/fs/proc/stat.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/cpumask.h>
++#include <linux/dnuma_view.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+@@ -52,6 +53,7 @@ static int show_stat(struct seq_file *p, void *v)
+ 	u64 sum = 0;
+ 	u64 sum_softirq = 0;
+ 	unsigned int per_softirq_sums[NR_SOFTIRQS] = {0};
++	u64 remote[DNUMA_VIEW_NSTAT] = {0};
+ 	struct timespec64 boottime;
+ 
+ 	user = nice = system = idle = iowait =
+@@ -88,16 +90,18 @@ static int show_stat(struct seq_file *p, void *v)
+ 		}
+ 	}
+ 
+-	seq_put_decimal_ull(p, "cpu  ", nsec_to_clock_t(user));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(nice));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(system));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(idle));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(iowait));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(irq));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(softirq));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(steal));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(guest));
+-	seq_put_decimal_ull(p, " ", nsec_to_clock_t(guest_nice));
++	/* CPUs of other machines count in the total (they are in clock ticks). */
++	dnuma_view_stat_sum(remote);
++	seq_put_decimal_ull(p, "cpu  ", nsec_to_clock_t(user) + remote[0]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(nice) + remote[1]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(system) + remote[2]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(idle) + remote[3]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(iowait) + remote[4]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(irq) + remote[5]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(softirq) + remote[6]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(steal) + remote[7]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(guest) + remote[8]);
++	seq_put_decimal_ull(p, " ", nsec_to_clock_t(guest_nice) + remote[9]);
+ 	seq_putc(p, '\n');
+ 
+ 	for_each_online_cpu(i) {
+@@ -130,6 +134,7 @@ static int show_stat(struct seq_file *p, void *v)
+ 		seq_put_decimal_ull(p, " ", nsec_to_clock_t(guest_nice));
+ 		seq_putc(p, '\n');
+ 	}
++	dnuma_view_stat_show(p);
+ 	seq_put_decimal_ull(p, "intr ", (unsigned long long)sum);
+ 
+ 	show_all_irqs(p);
+@@ -157,7 +162,7 @@ static int show_stat(struct seq_file *p, void *v)
+ 
+ static int stat_open(struct inode *inode, struct file *file)
+ {
+-	unsigned int size = 1024 + 128 * num_online_cpus();
++	unsigned int size = 1024 + 128 * (num_online_cpus() + dnuma_view_nr_cpus());
+ 
+ 	/* minimum size to display an interrupt count : 2 bytes */
+ 	size += 2 * irq_get_nr_irqs();
+diff --git a/include/linux/dnuma_view.h b/include/linux/dnuma_view.h
+index 677c0a739..0dcfdb90a 100644
+--- a/include/linux/dnuma_view.h
++++ b/include/linux/dnuma_view.h
+@@ -10,6 +10,8 @@
+ #include <linux/jump_label.h>
+ #include <linux/types.h>
+ 
++struct seq_file;
++
+ /* Fields of a "cpuN" line of /proc/stat, in the order they are printed. */
+ #define DNUMA_VIEW_NSTAT 10
+ 
+@@ -21,6 +23,38 @@ extern const struct seq_operations dnuma_view_cpuinfo_op;
+ /* True while a manager holds /proc/dnuma_view open for writing. */
+ DECLARE_STATIC_KEY_FALSE(dnuma_view_key);
+ 
++unsigned int __dnuma_view_nr_cpus(void);
++void __dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT]);
++void __dnuma_view_stat_show(struct seq_file *p);
++
++/* Number of remote CPUs currently shown. */
++static inline unsigned int dnuma_view_nr_cpus(void)
++{
++	if (static_branch_unlikely(&dnuma_view_key))
++		return __dnuma_view_nr_cpus();
++	return 0;
++}
++
++/* Adds the counters of all remote CPUs, in clock ticks, to @sum. */
++static inline void dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT])
++{
++	if (static_branch_unlikely(&dnuma_view_key))
++		__dnuma_view_stat_sum(sum);
++}
++
++/* Prints one "cpuN ..." line per remote CPU. */
++static inline void dnuma_view_stat_show(struct seq_file *p)
++{
++	if (static_branch_unlikely(&dnuma_view_key))
++		__dnuma_view_stat_show(p);
++}
++
++#else /* !CONFIG_DNUMA_VIEW */
++
++static inline unsigned int dnuma_view_nr_cpus(void) { return 0; }
++static inline void dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT]) { }
++static inline void dnuma_view_stat_show(struct seq_file *p) { }
++
+ #endif /* CONFIG_DNUMA_VIEW */
+ 
+ #endif /* _LINUX_DNUMA_VIEW_H */
+-- 
+2.34.1
+
