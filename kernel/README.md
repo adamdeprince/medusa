@@ -7,13 +7,15 @@ fetches the release from kernel.org, checks its SHA-256 against the published
 list and runs `make headers_install`; CMake refuses to configure without
 headers that define the userfaultfd interfaces it uses).
 
-This directory holds what belongs in the kernel: two optional changes for
+This directory holds what belongs in the kernel: optional changes for
 Linux 7.3.5, the test that boots the first one in a virtual machine, and
 the integration plan beyond them. Slaves never need a patched kernel.
 
 | | What it adds | State |
 |---|---|---|
 | `patches/` - the dnuma view, a series of five patches | slave CPUs and exported work in the master's `/proc` | tested in a virtual machine (normal and lockdep/KASAN builds) and end to end on a real master; see its *Status* |
+| Optional patch 6 | confirmed remote CPU pins in `sched_getaffinity()` | compiled and boot-tested in a Linux 7.3.5 KVM guest |
+| Optional patch 7 | attach a pager to an existing address space and evict registered private anonymous pages | boot-tested on live pthread and Go heaps in a Linux 7.3.5 KVM guest |
 | `untested/` - remote `MADV_DONTNEED`, one patch | lets the pager discard a page of another process itself | compiles in 7.3.5; **never booted** - kept apart from the series for that reason |
 
 ## `patches/`: slave CPUs and exported work in the master's `/proc`
@@ -104,6 +106,55 @@ sudo .../scripts/kexec-kernel.sh arch/x86/boot/bzImage /var/tmp/initrd-dnuma --n
 | End to end (master + slave + `top`) | `tests/integration/09_kernel_view.sh` on a master booted into 7.3.5 with these changes (by kexec, as above) and one slave offering 24 CPUs: 29 checks pass; the rest of the suite passes on that kernel too (`docs/testing.md`) |
 | Upstream | Not submitted, and not proposed in this form: showing CPUs the scheduler does not have is acceptable for a system that is explicit about it, not as a general kernel feature |
 
+## Optional patch 6 for querying a running body's CPU affinity
+
+Apply `patches/0006-sched-report-confirmed-remote-cpu-affinity.patch` after
+patches 1 through 5 using `patch -p1`. It extends `CONFIG_DNUMA_VIEW` on
+the master. For an explicit `export --cpu`, the agent acknowledges its
+successful Linux CPU pin. The master
+then writes `pin <tid> <cpu>` to the view. On this kernel,
+`sched_getaffinity()` returns that single CPU while the body runs, including
+CPU numbers beyond the master's native scheduler bitmap. The syscall retains
+its Linux task lookup and security check. Returning home, deleting the CPU
+or closing the manager's file clears the pin report. The original view
+protocol and independent kernels on the agents remain supported. A Linux
+7.3.5 KVM guest passed the kernel-view suite, including a query above
+`CPU_SETSIZE`, the short-mask error, and restoration of the home affinity
+mask on recall and CPU removal.
+
+The setter for cluster-wide CPU masks and preemptive export of native thread
+groups are still open. The executable path for selecting an exact CPU today
+is `dnumactl export <pid> --cpu <cluster-cpu>`.
+
+## Optional patch 7 for paging a live native heap
+
+Apply `patches/0007-userfaultfd-native-master-pager.patch` to the master
+kernel and enable `CONFIG_USERFAULTFD` and `CONFIG_DNUMA_NATIVE_PAGER`.
+Patch 7 is independent of the CPU view. A pager with `CAP_SYS_PTRACE` opens
+`/dev/userfaultfd` and passes a pidfd to `DNUMA_UFFD_ATTACH`. The kernel
+checks ptrace access and returns a userfaultfd bound to that address space.
+It stays bound to the same address space across exec and PID reuse. After
+registering a range, the pager can write-protect it, snapshot it, and call
+`DNUMA_UFFD_EVICT` on registered private anonymous pages. Eviction flushes
+the target's translations before returning. Sibling threads can keep running.
+
+To repeat the live tests, build the Linux userspace targets and a master
+kernel with both the CPU view and the native pager enabled. From the
+Medusa tree, include the optional Go 1.21+ target in the test initramfs:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o build/n_go_heap tests/integration/progs/n_go_heap.go
+DNUMA_TEST_NATIVE_PAGER=1 DNUMA_GO_HEAP="$PWD/build/n_go_heap" bash kernel/test/run.sh /path/to/bzImage
+```
+
+One test repeatedly revokes a heap page under application stores and
+`read(2)` into the same page while a sibling makes progress. The Go target
+runs garbage collection concurrently. A second test uses the master's page
+directory to alternate write ownership between two live processes in the
+guest. The test transports those page bytes within the guest. Enrolling a
+whole native process in the daemons also requires tracking mapping changes
+and writable aliases and fencing remote threads on failure.
+
 ## `untested/`: remote `MADV_DONTNEED` for a privileged pager
 
 **Problem.** To revoke a page from a process, its pager must remove the PTE
@@ -119,7 +170,8 @@ that to another:
   VMA (they share the uffd PTE bit), and dnuma needs write-protect for
   read-only sharing.
 
-So dnuma asks the image's own runtime to call `madvise(MADV_DONTNEED)` and then
+For a private anonymous image without patch 7 or remote advice, dnuma
+asks the image's own runtime to call `madvise(MADV_DONTNEED)` and then
 verifies the result through `/proc/pid/pagemap`, killing the image if the
 mapping is not gone in time. That is safe, but its liveness depends on the
 image.
@@ -139,7 +191,9 @@ of the image. If the kernel accepts it, every later invalidation is performed
 by the pager directly (`revoke_remote_zap` in the metrics, "revocation:
 process_madvise (performed by the pager)" in the log), still followed by the
 pagemap verification. On unpatched kernels the probe fails with `EINVAL` and
-the cooperative path is used. No rebuild or configuration is needed either way.
+the cooperative path is used for private anonymous images without patch 7.
+On stock slaves with missing and write-protect fault support for shmem, the
+agent can also revoke managed shadow pages by punching holes in its memfd.
 
 **Status.**
 

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Medusa exports single-threaded Linux processes and shares memory between runtime-managed threads over InfiniBand. A master-kernel experiment pages live Go heaps.">
+  <meta name="theme-color" content="#f7f6f1">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Medusa — An experiment in distributed NUMA on Linux">
+  <meta property="og:description" content="A Linux prototype for process export and distributed shared memory over InfiniBand RDMA.">
+  <meta property="og:url" content="https://medusa.goblinreactor.com/">
+  <meta property="og:image" content="https://medusa.goblinreactor.com/medusa.webp">
+  <link rel="canonical" href="https://medusa.goblinreactor.com/">
+  <link rel="stylesheet" href="style.css">
+  <title>Medusa — An experiment in distributed NUMA on Linux</title>
+</head>
+<body id="top">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="site-name" href="#top">Medusa</a>
+    <nav aria-label="Main navigation">
+      <a href="#architecture">Design</a>
+      <a href="#field-test">Validation</a>
+      <a href="#build">Build</a>
+      <a href="#docs">Docs</a>
+      <a href="https://github.com/adamdeprince/medusa">Source</a>
+    </nav>
+  </header>
+
+  <main class="wrap" id="main">
+    <header class="project-header">
+      <div>
+        <h1>Medusa</h1>
+        <p class="subtitle">An experiment in distributed NUMA on Linux</p>
+        <p class="metadata">x86-64 Linux · C++20 · GPL-2.0-only</p>
+      </div>
+      <img class="mascot" src="medusa.webp" width="1100" height="1100" alt="A black-and-white Silkie chicken with snakes curling out of its feather crest">
+    </header>
+
+    <section class="abstract" aria-labelledby="abstract-title">
+      <h2 id="abstract-title">Abstract</h2>
+      <p>Medusa studies two ways to use a remote CPU. An ordinary single-threaded program can move to another host and keep its PID and open files. A program built with <code>libdnuma</code> can run threads on both hosts at once and share a region of memory. In both cases the master coordinates the work, and each remote host runs an agent on stock Linux.</p>
+    </section>
+
+    <section id="architecture" aria-labelledby="architecture-title">
+      <h2 id="architecture-title">Design</h2>
+
+      <h3>Process export</h3>
+      <p>An agent runs the user-mode instructions of an eligible single-threaded process and fetches its pages on demand. The PID, file descriptors, and terminal remain on the master, where the original process executes forwarded system calls. Recall returns the modified pages and resumes the process on the master. With <code>--auto-export</code>, the master looks for eligible CPU-bound processes when local CPUs are oversubscribed and an agent has spare capacity. An operator can also select one of the agent’s CPUs with <code>dnumactl export PID --cpu ID</code>. <a href="https://github.com/adamdeprince/medusa/blob/main/docs/export.md">Process export notes</a></p>
+
+      <h3>Shared pages and thread placement</h3>
+      <p>A thread that reads a distributed page for the first time can fault it in over RDMA. Several hosts can keep read-only copies of the same 4 KiB page, even when the program has permission to write it. On the first write, the master waits for the other hosts to discard their copies before granting the writer exclusive access. <a href="https://github.com/adamdeprince/medusa/blob/main/docs/memory.md">Page ownership protocol</a></p>
+      <p>When a writable page repeatedly changes hands between two runtime-managed threads, the master can ask one to move closer to the other. This applies to threads created with automatic placement. The thread moves at its next call to <code>dnuma_migration_point()</code>. <a href="https://github.com/adamdeprince/medusa/blob/main/docs/execution.md#migration">Thread migration</a></p>
+
+      <h3>Native threads and Go</h3>
+      <p>An experimental master-kernel patch lets an external pager revoke a private heap page while the application’s other threads keep running. The remaining step for a stock Go program is to give its Linux threads one coherent address space across hosts and preserve their affinity, futex waits, and signals as they move. Today those threads run together on one host. <a href="https://github.com/adamdeprince/medusa/blob/main/docs/execution.md#native-linux-threads-and-go">Native thread support</a></p>
+    </section>
+
+    <section id="field-test" aria-labelledby="field-title">
+      <h2 id="field-title">Validation and limitations</h2>
+      <p>The two-host export suite checked an exact remote CPU pin, a checksum of a file held only on the master, and memory contents after recall. In a separate <code>libdnuma</code> test, readers on both hosts observed 3,000 writes with no stale reads detected. The locality policy also moved a managed thread.</p>
+      <p>In a Linux 7.3.5 VM, a Go process completed 128 heap-page eviction cycles while garbage collection ran. A separate test in the same VM alternated ownership of a page 256 times between a pthread process and a Go process. Both readers saw the preceding writer’s value. <a href="https://github.com/adamdeprince/medusa/blob/main/kernel/README.md#optional-patch-7-for-paging-a-live-native-heap">Reproduce the native pager tests</a></p>
+      <p>Hardware tests used one physical agent at a time. Multi-agent tests used simulation or a second agent on the master. Ordinary Linux <code>sched_setaffinity()</code> accepts local placement. Setting a remote-only mask from an application remains open.</p>
+      <p><a href="https://github.com/adamdeprince/medusa/blob/main/docs/testing.md">Test scenarios, measurements, and caveats</a></p>
+    </section>
+
+    <section id="build" aria-labelledby="build-title">
+      <h2 id="build-title">Build and reproduce</h2>
+      <p>The build requires x86-64 Linux, g++ 11 or later, CMake 3.20 or later, Ninja, and the <code>libibverbs</code> and <code>librdmacm</code> development files. The unit tests run without RDMA hardware.</p>
+      <pre aria-label="Build and test commands" tabindex="0"><code>git clone https://github.com/adamdeprince/medusa.git
+cd medusa
+scripts/kernel-headers.sh
+cmake -S . -B build -G Ninja \
+  -DDNUMA_KERNEL_HEADERS="$PWD/.deps/linux-7.3.5-headers/include"
+cmake --build build
+ctest --test-dir build</code></pre>
+      <p>To try process export, follow the <a href="https://github.com/adamdeprince/medusa#run">cluster setup instructions</a> to attach an agent over InfiniBand. On the master, start a checksum on a file large enough to keep the job running during export.</p>
+      <pre aria-label="Manual process export and recall commands" tabindex="0"><code>sha256sum large-file.iso &amp;
+pid=$!
+dnumactl export "$pid"
+dnumactl process list
+dnumactl recall "$pid"</code></pre>
+    </section>
+
+    <section id="docs" aria-labelledby="docs-title">
+      <h2 id="docs-title">Technical notes</h2>
+      <ul class="references">
+        <li><a href="https://github.com/adamdeprince/medusa/blob/main/docs/architecture.md">Architecture</a> — components, identities, and implementation status</li>
+        <li><a href="https://github.com/adamdeprince/medusa/blob/main/docs/execution.md">Execution</a> — thread placement and cooperative migration</li>
+        <li><a href="https://github.com/adamdeprince/medusa/blob/main/docs/lifecycle.md">Agent lifecycle</a> — attach, drain, disconnect, and failure handling</li>
+        <li><a href="https://github.com/adamdeprince/medusa/blob/main/docs/protocol.md">Wire protocol</a> — management, RDMA, and runtime channels</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="site-footer wrap">
+    <a href="https://goblinreactor.com/">Goblin Reactor</a>
+    <span aria-hidden="true">·</span>
+    <a href="https://github.com/adamdeprince/medusa/blob/main/LICENSE">GPL-2.0-only</a>
+  </footer>
+</body>
+</html>

@@ -10,6 +10,7 @@ program, no user accounts.
 ```
 $ sha256sum /data/big.iso &            # an ordinary process on the master
 $ dnumactl export $! slave1            # now computing on slave1; the file is still read here
+$ dnumactl slave status slave1         # "Cluster CPUs" gives the range to use
 $ dnumactl process list
 $ dnumactl recall <pid>                # or: it simply finishes
 ```
@@ -39,6 +40,19 @@ remotely.
 | `fork`, `clone`, `execve`, and any call without a descriptor | the process comes home and the call runs natively |
 | Exit | the body exits, P exits with the same status |
 
+An administrator can select the exact slave CPU with
+`dnumactl export <pid> --cpu <cluster-cpu>`. The agent sets the Linux CPU
+affinity of the body before executing its first instruction. The selection
+lasts for this export. With optional master kernel patch 6,
+`taskset -pc <pid>` and `sched_getaffinity()` report the acknowledged pin
+during that interval. Recall restores the home affinity report.
+
+Read-ahead transfers neighboring pages with write protection. A store to the
+faulting page requests write access to that page alone. A later store to a
+prefetched page takes a write-protection fault. Syscall output also checks
+the application's VMA permissions before the agent writes into a page.
+Only modified pages need to travel home.
+
 ### System calls
 
 Every system call the body makes stops it (ptrace `PTRACE_SYSEMU`, so the
@@ -57,26 +71,37 @@ Calls fall into five classes:
   resource, id calls...): executed at home as described.
 * **Memory** (`mmap`, `munmap`, `mprotect`, `brk`, `madvise`): executed at
   home so that P's address space stays the truth, and mirrored on the body.
-* **Local** (`arch_prctl`, `getcpu`, `sched_yield`, a futex wake with no
-  possible waiter): answered on the slave.
+* **Local** includes `arch_prctl`, `getcpu` and `sched_yield`, answered on the slave.
 * **Exit**.
 * **Home**: everything else. A call that is not described is never guessed
   at: the process is brought home and runs the call natively. It may be
   exported again afterwards.
 
+`FUTEX_WAKE_PRIVATE` and `FUTEX_WAKE_BITSET_PRIVATE` run in the original
+task at the original virtual address. Linux selects its private futex queue
+using the address and home address space. A native futex wait currently
+brings execution home so Linux can inspect the latest word.
+
 ### What can be exported
 
 A process is refused (and left exactly as it was) if it has more than one
-thread, is not a 64-bit process, has a writable shared mapping (other
-processes or a file would have to see its writes), or uses the address range
+thread, is not a 64-bit process, has a shared mapping whose backing can change elsewhere, or uses the address range
 the body stub occupies. A slave is refused as a target if its CPUs lack any
 instruction-set feature of the master's (a process may already have chosen
 code paths by them) or use a different extended register state layout.
 
+Read-only shared memfd mappings qualify when the backing has permanent
+write, grow and shrink seals. The master checks the mapped file, so closing
+the original fd does not affect export. A mapping with an external writable
+alias requires live invalidation. The exporter declines such processes and
+recalls an already exported process before it creates a mutable shared
+mapping. Private writable mappings use per-page dirty tracking.
+
 The automatic balancer only considers processes that are single-threaded,
 runnable, measurably CPU-bound over its last interval, and owned by a uid at
-or above `--export-uid-min` (default 1000). It only starts exports; a process
-comes home by itself or when its slave is drained.
+or above `--export-uid-min` (default 1000). A process with a restricted home
+CPU affinity mask stays home. The master checks its mask again after stopping
+it for export. A process comes home by itself or when its slave is drained.
 
 ### Coming home
 
@@ -155,11 +180,13 @@ master's CPUs.
 
 What does **not** change, deliberately:
 
-* The scheduler, CPU masks and affinity know only the master's CPUs.
+* With the original five kernel patches, the scheduler, CPU masks and affinity know only the master's CPUs.
   `nproc` (which counts the CPUs the caller may run on) and
   `sched_getaffinity` report the master's; a slave CPU cannot be the target
   of `taskset`. `lscpu`, which reads per-CPU sysfs directories, describes
-  the master.
+  the master. Patch 6 adds the affinity query for a confirmed remote body.
+  Selecting a remote CPU through `sched_setaffinity()` still requires a
+  kernel scheduling backend.
 * The kernel's own accounting. `getrusage`, `wait4` (and so `time cmd`) and
   cgroup CPU accounting contain only what ran on the master; the remote time
   is visible in `/proc/<pid>/stat` only.

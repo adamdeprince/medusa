@@ -4,21 +4,26 @@ One authoritative Linux machine (the **master**) plus dynamically attachable
 **slaves** that contribute CPUs and memory, connected by InfiniBand. There
 are two ways to use the slaves:
 
-* **Ordinary programs, unchanged.** A running process on the master is
+* **Ordinary single-threaded programs, unchanged.** A running process on the master is
   *exported*: its code executes on a slave CPU while the process itself -
-  pid, files, terminal, signals - stays on the master, which executes every
-  system call for it. Nothing is installed on the slave but the agent, and
+  PID, files, terminal, signals - stays on the master, which executes
+  forwarded system calls. Nothing is installed on the slave but the agent, and
   no shared file system is needed. With `--auto-export` the master does this
-  by itself whenever it has more runnable work than CPUs. See
-  `docs/export.md`.
+  for eligible CPU-bound processes when local CPUs are oversubscribed and a
+  slave has room. [Process export](docs/export.md)
 * **Programs written for it.** With `libdnuma`, threads of one logical
   process run on any machine and share one virtual address range; pages
   follow the accesses, moved between machines by RDMA under a single
-  ownership directory on the master.
+  ownership directory on the master. If two automatically placed threads
+  repeatedly take write access to the same page, the master can move them
+  closer together at a cooperative migration point. [Thread placement](docs/execution.md#migration)
 
-Slaves run stock kernels. The master does too, unless you want `top` and
-`/proc/cpuinfo` there to show the slaves' CPUs and the work done on them,
-which takes a small kernel patch on the master (`kernel/README.md`).
+Slaves run stock kernels. The master can run a stock kernel for both modes.
+Optional master patches display slave CPUs in `top` and `/proc/cpuinfo`,
+report a confirmed remote pin, and let a pager attach to a live native heap.
+The native pager has been tested with pthreads and Go in a VM. Distributing
+the Linux threads of one Go process still requires integrating that pager with
+per-thread placement. [Kernel tests](kernel/README.md) · [Native thread support](docs/execution.md#native-linux-threads-and-go)
 
 Built against **Linux 7.3.5 UAPI headers**; kernel features are detected at
 run time (slaves on 5.15 and 7.0 have been used). `docs/architecture.md`
@@ -97,20 +102,18 @@ them as on any other process.
 
 * Export moves whole single-threaded processes. A multi-threaded program is
   refused; so is one with a writable shared mapping. A process runs on one
-  machine at a time, and each system call it makes costs a network round
+  machine at a time, and each forwarded system call costs a network round
   trip, so it pays off for work that computes more than it calls.
 * Ordinary pthread programs do **not** run *across* machines. That needs the
   `libdnuma` API (`dnuma_alloc`, `dnuma_thread_create`, ...) and a static
   non-PIE build; only `dnuma_alloc()` memory and context stacks are
   distributed, and thread migration happens only at
   `dnuma_migration_point()`.
-* The kernel does not schedule on slave CPUs. With the view patch the
-  master's `/proc` *shows* them and the work exported processes do there;
-  `nproc`, affinity masks, `lscpu` and NUMA policy still describe the master
-  alone, and `time`/`getrusage` count only CPU time used on the master
-  (`docs/export.md`, "Seeing it"). The view patch has been tested in a
-  virtual machine and end to end on a real master (`docs/testing.md`). A second patch (remote `MADV_DONTNEED`) compiles and has never
-  been booted.
+* The Linux scheduler operates on local CPUs. The view patches display
+  remote execution on the master. An explicit `dnumactl export PID --cpu ID`
+  pins a native body on the agent. Optional patch 6 reports the confirmed
+  CPU through `sched_getaffinity()`. Ordinary `sched_setaffinity()` still
+  requires a local CPU in the mask. [Process export](docs/export.md)
 * One physical slave at a time has been used. Multi-slave logic is covered
   by unit simulation and by a second agent co-located on the master's host.
 * One master, state in memory, no restart recovery; management traffic is
@@ -178,7 +181,7 @@ dnumactl topology
 dnumactl memory status [--slave <name>]
 dnumactl process list  [--slave <name>]
 dnumactl metrics       [--slave <name>]
-dnumactl export <pid> [<name>]              # move a running process to a slave
+dnumactl export <pid> [<name>] [--cpu <cluster-cpu>]  # CPU IDs appear in slave status
 dnumactl recall <pid> | --all               # bring exported processes home
 dnumactl fault <name> <pull-delay ms | drop-rdma | partition ms | exit>   # testing only
 ```
@@ -213,7 +216,7 @@ See `include/dnuma/dnuma.h` and `examples/hello.cc`.
 ## Tests
 
 ```
-tests/run_all.sh                  # 33 unit tests, 9 integration and 4 failure scripts
+tests/run_all.sh                  # unit, integration and failure suites
 DNUMA_ASAN=1 tests/run_all.sh
 kernel/test/run.sh <bzImage>      # the kernel view, in a virtual machine
 ```
@@ -253,7 +256,7 @@ kernel they apply to.
 ## How this was written
 
 The code, tests, kernel patches and documentation in this repository were
-written by an AI coding assistant (Claude) under the direction of the
+written with AI coding assistants under the direction of the
 repository's owner, on the owner's machines. Every statement about what
 was tested refers to a run that actually took place; `docs/testing.md`
 says which, and what has not been tested.

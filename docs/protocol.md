@@ -128,7 +128,7 @@ home node):
 
 | Message | Direction | Meaning |
 |---|---|---|
-| `PAGE_REQUEST` | N->C | A local thread faulted; need read or write access |
+| `PAGE_REQUEST` | N->C | A local thread needs read or write access. The optional request ID identifies the faulting execution context (zero if unknown) |
 | `PAGE_REVOKE` | C->N | Give up access: `export`, `downgrade+export`, `invalidate+export`, `invalidate` |
 | `PAGE_REVOKED` | N->C | Done (verified); slot of the staged copy if exported |
 | `PAGE_GRANT` | C->N | Access granted; data source is `zero`, `local` or `remote(machine, incarnation, slot)`. A non-zero status refuses the request (unallocated address) |
@@ -193,6 +193,13 @@ range, canary, uid/gid; on the master also a `/dev/userfaultfd` descriptor)
 kernel-mode faults are handled). Then `RT_ZAP` / `RT_ZAP_DONE` (unmap a range),
 the `EXEC_*`, `SYSCALL_*` and `APP_*` messages above. If this connection
 closes, the daemon kills the image and the image kills itself.
+
+A shadow runtime that supports shmem puts `kRtShmemBacking` in the
+`RT_HELLO` request ID. An agent that can handle both missing and write
+faults on shmem echoes that ID in `RT_WELCOME` and passes a size-sealed
+memfd. The shadow maps it at the assigned address and closes the descriptor.
+The agent retains its descriptor for page revocation. A zero reply ID uses
+the original anonymous mapping. Older peers can use the same handshake.
 
 ## Control socket (Unix, `dnumactl` <-> master)
 

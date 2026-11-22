@@ -16,11 +16,10 @@ are disabled on the range.
 
 * Every image maps the same range (default base `0x2000_0000_0000`, size
   1 TiB, both chosen by the master and sent in the registration reply) as
-  private anonymous memory with `MAP_NORESERVE | MAP_FIXED_NOREPLACE`, and
+  private anonymous memory or, on a capable slave, a shared memfd, and
   registers all of it with userfaultfd in `MISSING | WP` mode.
-* The userfaultfd is created by the image (it must be: a userfaultfd binds to
-  the creating `mm`) and passed to the local node daemon, which from then on
-  is the only reader. On the master the master hands the image a
+* The managed image creates a userfaultfd bound to its own `mm` and passes
+  it to the local node daemon, which becomes the only reader. The master hands the image a
   `/dev/userfaultfd` descriptor so that an unprivileged process gets a
   descriptor that can resolve kernel-mode faults; on the slave (5.15, no device
   node) the agent starts the image privileged and it drops to the user's
@@ -36,7 +35,7 @@ are disabled on the range.
 
 On the machine that holds it, a page is in exactly one of two places:
 
-* **mapped** - in the local image's anonymous memory, placed on a physical
+* **mapped** - in the local image's distributed mapping, placed on a physical
   NUMA node chosen by the pager (`UFFDIO_COPY` allocates under the calling
   thread's memory policy, so the pager sets `MPOL_PREFERRED` to the page's home
   node before installing it);
@@ -146,10 +145,13 @@ it) must lose the mapping itself, or its threads would keep reading stale
 data. This is the step the brief singles out. What dnuma does:
 
 1. write-protect (above) and, if the contents are needed, copy them out;
-2. have the mapping removed with `MADV_DONTNEED` on the page - by the pager
-   itself through `process_madvise()` where the kernel allows it, otherwise by
-   the image's runtime service thread on request. `MADV_DONTNEED` clears the
-   PTE and performs the TLB shootdown on all CPUs before returning;
+2. remove the mapping. On a patched master the pager uses
+   `DNUMA_UFFD_EVICT` on registered private anonymous pages. On a stock
+   slave that negotiated shmem, the agent punches a hole in the backing
+   memfd and clears the userfaultfd write-protect marker. This discards
+   both PTEs and the cached page. Anonymous images can also use remote
+   `process_madvise()` where supported, or ask their runtime service thread
+   to call `madvise(MADV_DONTNEED)`;
 3. **verify** through `/proc/<pid>/pagemap` that the page is neither present
    nor swapped;
 4. only then wake any thread blocked on the page (it re-faults as "missing")
@@ -181,9 +183,9 @@ run time. Reading 7.3.5's `mm/userfaultfd.c` and `mm/madvise.c` established:
 | `/dev/userfaultfd` (6.1+) | Lets a privileged daemon delegate creation of a kernel-fault-capable descriptor. | Used on the master; the slave's 5.15 lacks it. |
 | `UFFDIO_POISON` (6.6+) | Marks pages so that access raises `SIGBUS`. | Natural implementation of `LOST`; not needed while dependents of a failed machine are killed. |
 
-On both of today's kernels the cooperative-plus-verified path is therefore the
-one in use (`revocation: cooperative unmap + pagemap verification` in the
-daemon logs).
+The image-ready log records the selected revocation method. The two-host
+managed-thread test exercised shmem hole punching on a stock slave over
+RDMA. Master patch 7 was tested separately in a VM on live native heaps.
 
 ## Physical placement
 
@@ -212,7 +214,10 @@ faults, transfers, invalidations, ownership transitions, migrations.
 
 ## Memory overhead
 
-A directory entry is 48 bytes per allocated page (about 1.2% of the memory it
-describes) plus a node-side record of similar size per page a node holds.
-This is adequate for the current scale and would need a denser encoding
-(extent-based for uniform regions) for very large address spaces.
+The directory records each region's bounds and initial ownership once. It
+allocates per-page state the first time a directory operation involves that
+page. Managed allocations initially have no backing. For a registered native
+mapping the first remote request fetches the original bytes from the home
+address space. Resident and owned page counts cover pages the directory has
+started tracking individually. Registering or releasing an untouched native
+arena costs one region entry regardless of its virtual size.

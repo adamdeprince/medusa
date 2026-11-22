@@ -1,15 +1,11 @@
 # dnuma architecture
 
-dnuma turns several multiprocessor x86-64 servers connected by InfiniBand into
-one asymmetric NUMA system. One machine, the **master**, runs the authoritative
-Linux instance. Other machines, **slaves**, contribute CPU cores and physical
-memory and are controlled by the master. Threads of one logical process run on
-any machine and share one virtual address space.
-
-This document describes what exists today, on which facts it rests, and where
-the userspace implementation stands in for work that ultimately belongs in the
-kernel. Statements about hardware and kernels come from inspecting the test
-machines, not from assumption (see *Reference test environments*).
+Medusa connects x86-64 Linux servers over InfiniBand. The master owns process
+identity and placement decisions. Each slave runs an agent on stock Linux.
+An eligible single-threaded Linux process can execute on a slave and return
+home. Programs linked with `libdnuma` can run execution contexts on several
+hosts at once and share explicitly allocated memory. Native thread groups,
+including those created by Go, still execute on one host.
 
 ## Reference test environments
 
@@ -36,9 +32,10 @@ was visible on both machines through a shared file system, which is a
 convenience of `scripts/cluster.sh` and not something dnuma relies on:
 process export in particular needs nothing on the slave but the agent.
 
-Two facts about kernels shape the design: a slave may have no userfaultfd
-feature newer than 5.15's, and no kernel lets one process remove a mapping
-from another (see `memory.md`, "What the kernel permits").
+The pager probes each kernel at startup. On a capable stock slave the agent
+can invalidate managed pages through their shared backing file. Master patch
+7 adds external registration and eviction for private anonymous pages in a
+live native process. [Revocation mechanisms](memory.md)
 
 ## Components
 
@@ -75,9 +72,9 @@ coherence (`src/master/coherence.*` decides, `src/node` enforces), process
 management (`src/master/master_proc.cc`, `src/runtime`), lifecycle
 (`src/master/lifecycle.*`, `master_slaves.cc`, `src/agent`).
 
-Every daemon is a single-threaded epoll reactor: sockets, RDMA completion
-channels, CM events, userfaultfds, pidfds, signals and timers are all event
-sources. Nothing polls.
+The master and agent use epoll for sockets, RDMA completion channels,
+userfaultfds, pidfds, signals and timers. Native process export also uses
+worker threads to service running bodies and their page requests.
 
 ## Identities
 
@@ -131,12 +128,12 @@ the precise list of what transparent pthread support still needs.
 There is a second, independent way to use slave CPUs, for programs that know
 nothing of dnuma. An ordinary single-threaded process on the master can be
 **exported**: its user code then executes in a *body* on a slave, while the
-process itself stays on the master and executes every system call the body
-makes. Here the whole address space travels (lazily, page by page) and
-nothing is shared, so none of the limitations above apply - but one process
-runs on one machine at a time. `docs/export.md` describes it; the components
-are `src/master/export*.cc` (home side), `src/agent/body.cc` (slave side)
-and `src/export/` (system-call descriptors, messages).
+process itself stays on the master and executes forwarded system calls.
+The body fetches pages on demand. It tracks writes even to prefetched pages
+and returns the modified pages on recall. Only one host executes the
+program’s user code at a time. The implementation is in
+`src/master/export*.cc`, `src/agent/body.cc` and `src/export/`.
+[Export and recall](export.md)
 
 ## Channels
 
@@ -183,17 +180,19 @@ Details in `protocol.md`.
 | RDMA links, per-link PDs, verified READ/WRITE, credit flow control | implemented; tested |
 | Page directory, MSI-style coherence, invalidation, migration, populate, abort | implemented; unit-tested with simulated multi-slave interleavings; tested on hardware |
 | Remote execution on real CPUs, placement verification | implemented; tested (all 8 NUMA domains) |
-| Cooperative thread migration (at migration points) | implemented; tested (drain) |
+| Managed thread migration | Drain, explicit migration, and locality-based placement use cooperative migration points. Repeated write handoffs prompted a move in the two-host coherence test. |
 | Forwarded system calls, cross-machine futex and mutex | implemented; tested (`getpid`, `write`, futex) |
 | Drain (with capacity check, timeout, cancel) | implemented; tested |
 | Hard disconnect, failure detection, fencing, lease proof | implemented; tested |
 | Two slaves, slave-to-slave transfers | implemented; tested with a second agent co-located on the master's host - **not** with a third machine |
+| Native heap paging | Master patch 7 paged private anonymous memory while sibling threads ran. Tested with pthreads and Go in one VM. |
+| Agent-side invalidation | A stock agent punched holes in a memfd backing a managed shadow image. Tested on two physical hosts. |
 | Pager-side unmap (`process_madvise`) | implemented and probed at run time; needs the kernel patch in `kernel/untested/`, which is compile-checked but **not booted** |
 | Process export: unmodified single-threaded programs moved to a slave while running, system calls and I/O executed on the master, automatic balancer | implemented; tested (`docs/export.md`) |
 | Slave CPUs and exported work visible in the master's `/proc` (top, ps, `/proc/cpuinfo`) | implemented; needs the kernel view series (`kernel/patches/`) on the master. Kernel side and the master's client tested in a virtual machine; end to end see `docs/testing.md` |
 | Transparent pthreads, automatic syscall interception, distributed heap/TLS/static data | **not implemented** (design in `execution.md`) |
-| Preemptive (asynchronous) thread migration, XSAVE transfer | **not implemented** (design in `execution.md`) |
-| Automatic page reclaim/eviction policy, scheduler policies beyond explicit and least-loaded | **not implemented** |
+| Preemptive migration of native sibling threads | Open. The single-threaded exporter already transfers extended register state on export and recall. |
+| Automatic reclamation under memory pressure | Open. Today faults move pages on demand, and drain or explicit requests can move them elsewhere. |
 | LOST page state after partial failure | state exists; never entered, because dependents of a failed slave are killed (the conservative rule in the brief) |
-| Kernel-visible NUMA nodes, kernel-scheduled remote tasks, slave CPUs in affinity masks | **not implemented**; see `kernel/README.md` |
+| Remote CPU affinity | An explicit export can pin its body to one remote CPU. Master patch 6 reports that pin through `sched_getaffinity()`. Native remote affinity setting and kernel-visible remote NUMA nodes remain open. |
 | Master restart / persistence / high availability | **not implemented**: one master, in-memory state |

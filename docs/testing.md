@@ -1,8 +1,8 @@
 # Testing
 
-Everything below is run by `tests/run_all.sh` on the master host. Tests check
-memory contents, executing host and CPU, physical placement, process survival
-and exit status - not just that a request returned success.
+Run the userspace suite on the master. Its checks cover memory contents,
+executing host and CPU, physical placement, process survival and exit status.
+The master-kernel experiments run separately in QEMU.
 
 ```
 tests/run_all.sh                 # unit + integration + failure
@@ -21,7 +21,7 @@ start|stop|status|logs` runs the daemons (a cluster key is generated on first
 use in `.deps/`). If the site file gives the agent `--nodes`, the tests
 compare the master's view with those nodes only.
 
-## Unit tests (`tests/unit`, 33 tests)
+## Unit tests (`tests/unit`)
 
 | File | What it checks |
 |---|---|
@@ -59,7 +59,6 @@ thoroughly. It is a simulation of the node side, not physical machines.
 | `04_drain_nomem.sh` | Master capacity set to 16 MiB, 64 MiB on the slave: the drain fails with "insufficient memory elsewhere", slave still ACTIVE, nothing terminated, application finishes intact on the slave. Then an application without migration points: a 2 s drain times out naming the stuck context, slave still ACTIVE, application finishes intact. |
 | `05_hard.sh` | A dependent application (the slave) and an unrelated one (the master only). Dry run lists exactly the dependent PID and changes nothing; non-interactive hard disconnect without `--yes` is refused; with `--yes` the dependent process exits with 137 (SIGKILL), its image and metadata are gone, fencing is agent-confirmed, the unrelated application finishes intact; repeat is a no-op; reattach works and runs new work. |
 | `06_two_slaves.sh` | A second agent with its own identity runs on the master (see the caveat below). 12 NUMA domains; data written on the slave is read and rewritten on the second slave and read back on the slave, with pages pulled directly between the two slaves; `t_exec` across all 12 domains; a drain of the slave with the master nearly full evacuates to the other slave; killing the slave's agent kills only the slave's dependent while an application on the other slave finishes, and the survivor drops its link to the failed peer. |
-
 | `07_export.sh` | Process export with an ordinary program (`n_spin`: CPU-bound, rewrites and verifies a 16-64 MiB buffer, does file I/O in a directory that exists only on the master). Export and recall while running: the program reports having run on a slave CPU and then on a master CPU again, memory verified throughout, exit code 0. SIGTERM while exported: exit status 143. SIGSTOP/SIGCONT while exported: state `T`, no progress while stopped, then completes. `sha256sum` of a 300 MB file that exists only on the master, exported mid-run: correct digest. Counters: system calls forwarded, pages served; nothing lost, no body left on the slave. |
 | `08_export_balancer.sh` | Automatic export. `xargs -P` starts more CPU-bound processes than the master has CPUs (by default as many extra as the slave offers). Every process reports PASS; at least half of the excess ran on slave CPUs; none lost; nothing left behind on either machine. Prints rounds completed per process for those that stayed and those that were exported. |
 | `09_kernel_view.sh` | Needs the kernel view series (`kernel/patches/`) on the master; otherwise reports "not run". With a slave attached: `/proc/cpuinfo` lists master plus offered slave CPUs, the slave's with its own model name and a `dnuma host` line; `/proc/stat` has their lines and their counters advance at the slave's clock rate; sysfs `online` and `getconf _NPROCESSORS_ONLN` count them; `top` has a row for the last slave CPU. For an exported process: `/proc/<pid>/stat` shows a slave CPU, state `R`, CPU time growing; `ps` agrees; `top` shows it using a CPU and shows that CPU busy. After recall: a master CPU again, and the remote CPU time is still counted. After drain, reattach and master stop: the view shrinks, returns with the same numbers, and is empty. |
@@ -98,7 +97,25 @@ controlled substitutes.
 
 ## Results
 
-Latest run (master and slave B of `docs/architecture.md`, the agent offering
+### Native paging and placement
+
+| Environment | Result |
+|---|---|
+| Patched Linux 7.3.5, one VM | The pager evicted a live heap page 128 times in each of the pthread and Go fixtures. User stores and kernel writes through `read(2)` resumed with the expected bytes. A sibling thread made progress, and the Go fixture ran GC. |
+| Same VM, two native processes | The page directory mediated 256 write handoffs between a pthread process and a Go process. Each read observed the preceding store. The test delivered directory messages and page bytes within the guest. |
+| Master and one physical agent, managed threads | Readers on both hosts observed 3,000 writes with zero stale-read violations. Atomic and mutex counters reached their expected totals, and a locality request produced a completed cooperative migration. |
+| Same two hosts, native single-thread export | All 25 export regression checks passed. The suite exercised an exact CPU pin, write tracking on prefetched pages, master-side private futex wakes, recall, signal handling and I/O on a master-only file. |
+| Local Linux affinity | All six CTest targets passed, including `native_thread_pair_local`. Two pthreads selected local CPUs, checked `getcpu()` and exchanged updates using private futexes. Giving one thread a remote-only mask returned `EINVAL`. |
+
+For the VM runs, build the optional Go fixture and enable the pager test in
+the initramfs. The standalone pthread acceptance program takes two CPU IDs
+and can be run separately from the cluster suite.
+[VM build and run commands](../kernel/README.md#optional-patch-7-for-paging-a-live-native-heap) ·
+[Native thread acceptance test](execution.md#native-linux-threads-and-go)
+
+### Full cluster suite
+
+Earlier full-suite run (master and slave B of `docs/architecture.md`, the agent offering
 one NUMA node of 24 CPUs; the master booted into 7.3.5 with the kernel
 view series), normal build: 5 unit programs (33 tests), 9 integration scripts
 (178 checks) and 4 failure scripts (58 checks) - all pass, with no warning

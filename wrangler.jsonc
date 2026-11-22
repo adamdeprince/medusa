@@ -1,0 +1,15 @@
+{
+  "name": "medusa",
+  "compatibility_date": "2026-11-21",
+  "assets": {
+    "directory": "./html"
+  },
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "medusa.goblinreactor.com",
+      "custom_domain": true
+    }
+  ]
+}

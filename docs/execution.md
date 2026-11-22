@@ -95,6 +95,19 @@ What does not move: thread-local storage. A fiber sees its *carrier's* TLS, so
 after a migration `errno` and `__thread` variables are different objects. Code
 must not keep TLS-derived pointers across a migration point.
 
+For threads created with `DNUMA_NODE_ANY`, the pager identifies the faulting
+execution context when the kernel supplies its TID. A committed write that
+takes a page away from a recent remote accessor contributes its measured
+transaction time toward moving the two contexts together. Read replication
+alone contributes nothing. The master ages these observations with a
+one-second half-life and requests a move when repeated handoffs cost more
+than the observed median migration, initially estimated at five milliseconds.
+The destination must accept work and have space for another execution
+context. The move takes effect at the worker's next migration point.
+Explicit node selection and successful manual placement exclude a context
+from automatic locality moves. `locality_migration_requests` counts the
+requests and `thread_migrations` counts completed moves.
+
 Used by drains (`lifecycle.md`) and by `dnuma_thread_migrate()`. Measured in
 the drain test: two contexts moved from the slave to the master mid-computation and
 finished with correct results (`thread_migration_ns` in `dnumactl metrics`).
@@ -152,25 +165,40 @@ a per-call policy table - forward (descriptors, futex, signals, process
 state), execute locally (`getcpu`, `sched_yield`, clocks), or emulate against
 master state (`gettid`).
 
-## What transparent pthread programs still need
+## Native Linux threads and Go
 
-The brief asks that this be stated precisely rather than claimed:
+A Go process creates ordinary Linux threads. Its runtime schedules goroutines
+on those threads. Medusa's native exporter currently moves one task with its
+home task stopped. If a sibling were allowed to run at home, it could change
+a heap page after the remote body fetched it. The export path therefore
+requires a single-threaded process.
 
-1. **All writable memory distributed** - static data, heap, TLS - not only
-   `dnuma_alloc()` regions. Requires registering those mappings with
-   userfaultfd at exec time and a distributed `brk`/`mmap`.
-2. **TLS that moves**: a per-context TCB in distributed memory with the FS
-   base set to it on whichever carrier runs the context (and `rseq`,
-   `set_tid_address`, robust-list state re-registered on arrival).
-3. **`pthread_create` interposition** onto execution contexts, with thread
-   ids, `pthread_self`, cancellation and exit semantics preserved.
-4. **Automatic system-call forwarding** (above), including signals delivered
-   to the right native thread and `exit_group` semantics across images.
-5. **Preemptive migration** (above), so placement does not depend on
-   migration points.
-6. **Shared libraries and ASLR**: identical layout for dynamically linked
-   programs (the same objects at the same addresses).
+Master kernel patch 7 can attach to a native address space and page existing
+private anonymous memory. In the VM tests, a pthread and a Go process exchange
+ownership of a heap page through the master's directory. The Go process uses
+the stock runtime and runs garbage collection during the test.
 
-Items 1-4 are runtime work on top of the mechanisms that exist; 5 needs the
-signal-frame design; with kernel integration (`kernel/README.md`) most of
-them move into the kernel instead.
+Cross-host execution of one native thread group needs the following work.
+
+1. Connect the exporter and the agent's native bodies to one directory per
+   address space. Track `mmap`, `munmap`, `mprotect`, `brk`, address reuse
+   and writable aliases, including changes initiated by a sibling.
+2. Place individual Linux TIDs and observe `clone` and `clone3` so new
+   threads inherit placement and process membership. Preserve TLS, extended
+   registers, signal masks, `rseq`, robust lists and clear-child-TID state
+   when a thread moves or exits.
+3. Keep a native thread placed remotely while a private futex wait blocks
+   at home. Private wake and bitset wake already use the home kernel.
+   Deliver thread-directed signals to the intended TID, including Go's
+   asynchronous preemption signal. Coordinate group stop, exec and exit.
+4. Apply Linux affinity masks to placement, confirm execution on a permitted
+   CPU, and keep the mask across migration. Page ownership changes identify
+   threads that contend for the same writable page. The placement policy
+   can use that evidence to move either thread to an allowed host.
+
+`build/tests/n_thread_pair <cpu-a> <cpu-b>` exercises the ordinary Linux
+interface. Two pthreads pin themselves, check their actual CPUs and TIDs,
+and alternate updates to a shared heap using private futexes. Running on two
+local CPUs provides the baseline. Passing a local and a remote CPU is the
+cross-host acceptance test. The current remote affinity setter returns
+`EINVAL` for a remote-only mask on the home kernel.
