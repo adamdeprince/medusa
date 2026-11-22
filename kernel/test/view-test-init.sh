@@ -100,6 +100,15 @@ exec 3<>/proc/dnuma_view && ok "a new writer can open it" || bad "reopen"; exec 
 echo "  the master's client (tests/unit/test_kernel_view) against this kernel:"
 /bin/test_kernel_view 2>&1 | sed 's/^/      /'
 /bin/test_kernel_view > /tmp/client.out 2>&1; grep -q "0 failure" /tmp/client.out && ! grep -q "not run" /tmp/client.out && ok "client test ran and passed" || bad "client test"
+case " $(cat /proc/cmdline) " in
+  *" dnuma.test_native_pager=1 "*)
+    /bin/n_native_pager && ok "native pthread heap" || bad "native pthread heap"
+    /bin/n_native_pager --pair && ok "native page handoffs" || bad "native page handoffs"
+    if [ -x /bin/n_go_heap ]; then
+      /bin/n_native_pager /bin/n_go_heap && ok "native Go heap" || bad "native Go heap"
+      /bin/n_native_pager --pair /bin/n_go_heap && ok "pthread and Go page handoffs" || bad "pthread and Go page handoffs"
+    fi ;;
+esac
 echo "--- kernel log (warnings and worse)"
 dmesg | grep -iE "BUG|WARNING|Oops|RCU|lockdep|sleeping function|KASAN|UBSAN|circular|dnuma" | head -40
 echo "KTEST end: $F failure(s)"

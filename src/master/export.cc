@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <csignal>
 #include <cstring>
+#include <iterator>
 
 #include <dirent.h>
 #include <elf.h>
@@ -12,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -87,6 +89,34 @@ uint64_t find_syscall_insn(int memfd, const std::vector<ProcVma>& maps) {
 }
 
 std::string comm_of(pid_t pid) { return read_attr("/proc/" + std::to_string(pid) + "/comm"); }
+
+// Read-only VMA permissions constrain this process. Other mappings and file
+// descriptors can still modify the same backing. These seals are permanent.
+bool immutable_file(const std::string& path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) < 0 || !S_ISREG(st.st_mode)) return false;
+    Fd fd(open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY));
+    if (!fd.valid()) return false;
+    int seals = fcntl(fd.get(), F_GET_SEALS);
+    constexpr int required = F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW;
+    return seals >= 0 && (seals & required) == required;
+}
+
+// A restricted Linux affinity mask is a placement decision, including a
+// cpuset restriction. The automatic balancer must leave that task at home.
+bool unrestricted_home_affinity(const std::string& status) {
+    const std::string field = "\nCpus_allowed_list:";
+    size_t pos = status.find(field);
+    if (pos == std::string::npos) return false;
+    pos += field.size();
+    auto allowed = parse_cpulist(status.substr(pos, status.find('\n', pos) - pos));
+    auto online = parse_cpulist(read_attr("/sys/devices/system/cpu/online"));
+    auto possible = parse_cpulist(read_attr("/sys/devices/system/cpu/possible"));
+    // The optional kernel view appends remote CPUs to online only.
+    std::vector<int> local;
+    std::set_intersection(online.begin(), online.end(), possible.begin(), possible.end(), std::back_inserter(local));
+    return !local.empty() && std::includes(allowed.begin(), allowed.end(), local.begin(), local.end());
+}
 
 int thread_count(pid_t pid) {
     int n = 0;
@@ -178,7 +208,7 @@ void ExportManager::erase(uint64_t xid) {
         by_pid_.erase(it->second.pid);
         exports_.erase(it);
     }
-    if (hooks_.on_end) hooks_.on_end(m, pid);
+    if (hooks_.on_end) hooks_.on_end(xid, m, pid);
 }
 
 // ============================ starting ============================
@@ -209,6 +239,8 @@ Status ExportManager::bootstrap(Export& x, std::vector<XVma>* vmas, std::vector<
         // A writable shared mapping is visible to other processes (or a file)
         // as it changes; a body's private copy could not honour that.
         if (v.shared && (v.prot & kVmWrite)) return Status::err(ENOTSUP, "has a writable shared mapping (%s)", v.name.empty() ? "anonymous" : v.name.c_str());
+        if (v.shared && !immutable_file(format("/proc/%d/map_files/%" PRIx64 "-%" PRIx64, pid, v.start, v.end)))
+            return Status::err(ENOTSUP, "shared mapping at 0x%" PRIx64 " can change through another mapping or descriptor", v.start);
         if (v.name == "[vdso]") {
             x.vdso_start = v.start;
             x.vdso_end = v.end;
@@ -251,9 +283,12 @@ Status ExportManager::bootstrap(Export& x, std::vector<XVma>* vmas, std::vector<
     return Status::ok();
 }
 
-Status ExportManager::start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu) {
+Status ExportManager::start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu, ExportPlacement placement) {
     if (by_pid_.count(pid)) return Status::err(EALREADY, "already exported");
     if (thread_count(pid) != 1) return Status::err(ENOTSUP, "has more than one thread");
+    auto proc_status = [&] { return read_attr("/proc/" + std::to_string(pid) + "/status"); };
+    if (placement == ExportPlacement::Balance && !unrestricted_home_affinity(proc_status()))
+        return Status::err(EAGAIN, "home CPU affinity is restricted");
     if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_TRACESYSGOOD) != 0) return Status::sys("cannot take control of pid %d", pid);
     int st = 0;
     Status s = pt_interrupt(pid, &st);
@@ -264,6 +299,17 @@ Status ExportManager::start(pid_t pid, MachineId machine, int cpu, int node, int
         ptrace(PTRACE_DETACH, pid, 0, sig);
         return Status::err(EAGAIN, "a signal is being delivered");
     }
+    // A clone can finish between the initial task census and the stop.
+    // Check again before treating the home address space as quiescent.
+    if (thread_count(pid) != 1) {
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+        return Status::err(ENOTSUP, "thread group changed during export");
+    }
+    std::string status = proc_status();
+    if (placement == ExportPlacement::Balance && !unrestricted_home_affinity(status)) {
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+        return Status::err(EAGAIN, "home CPU affinity changed during export");
+    }
     Export x;
     x.xid = next_xid_;
     next_xid_ += xid_step_;
@@ -271,9 +317,9 @@ Status ExportManager::start(pid_t pid, MachineId machine, int cpu, int node, int
     x.comm = comm_of(pid);
     x.machine = machine;
     x.cpu = cpu;
+    x.explicit_cpu = placement == ExportPlacement::SelectCpu;
     x.t0 = now_ns();
     x.stopped = true;
-    std::string status = read_attr("/proc/" + std::to_string(pid) + "/status");
     size_t up = status.find("\nUid:"), gp = status.find("\nGid:");
     if (up != std::string::npos) x.uid = uint32_t(strtoul(split(status.substr(up + 5, 64), '\t')[1].c_str(), nullptr, 10)); // effective
     if (gp != std::string::npos) x.gid = uint32_t(strtoul(split(status.substr(gp + 5, 64), '\t')[1].c_str(), nullptr, 10));
@@ -495,6 +541,13 @@ void ExportManager::run_syscall(Export& x, const XSyscallMsg& m) {
 
     uint64_t args[6];
     for (int i = 0; i < 6; ++i) args[i] = m.args[size_t(i)];
+    if (m.nr == SYS_mmap && (args[3] & MAP_SHARED) &&
+        ((args[2] & PROT_WRITE) || (args[3] & MAP_ANONYMOUS) ||
+         !immutable_file(format("/proc/%d/fd/%d", x.pid, int(args[4]))))) {
+        // Recall before mmap takes effect. The original thread executes it
+        // once, including MAP_FIXED replacement or the kernel's error path.
+        return start_home(x, "mapping mutable shared backing");
+    }
     const SysDesc& d = describe_syscall(m.nr, args);
     x.desc = &d;
     x.nr = m.nr;
@@ -898,6 +951,9 @@ void ExportManager::on_node_msg(MachineId from, const Msg& m) {
         if (r.status != 0) return abort_start(*x, r.text);
         LOG_INFO("pid %d (%s) now executes on %s as CPU %d (body pid %d)", x->pid, x->comm.c_str(),
                  hooks_.machine_name(from).c_str(), x->cpu, r.body_pid);
+        bool pin_confirmed = m.req_id == uint64_t(x->cpu) + 1;
+        if (x->explicit_cpu && !pin_confirmed) start_home(*x, "agent did not confirm the requested CPU");
+        if (hooks_.on_ready) hooks_.on_ready(x->xid, x->pid, x->cpu, x->explicit_cpu && pin_confirmed);
         bool recall_now = x->st == St::Homing;
         park(*x);
         if (recall_now) start_home(*x, x->why);
@@ -948,7 +1004,10 @@ void ExportManager::on_node_msg(MachineId from, const Msg& m) {
         XSimpleMsg d;
         if (!parse_msg(m, &d)) return;
         Export* x = get(d.xid);
-        if (x && x->have_home) arrive_home(*x);
+        if (x && x->have_home) {
+            if (x->pages_back != d.count) return lost(*x, "could not restore every modified page on recall");
+            arrive_home(*x);
+        }
         return;
     }
     case MsgType::XGone: {

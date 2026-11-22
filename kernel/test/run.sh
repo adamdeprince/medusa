@@ -22,7 +22,7 @@ initrd="$(readlink -f "$initrd")"
 accel="-cpu max"; [ -w /dev/kvm ] && accel="-enable-kvm -cpu host"
 log="$(mktemp)"
 timeout 600 ${DNUMA_QEMU:-qemu-system-x86_64} $accel -smp 4 -m 3072 -nographic -no-reboot \
-  -kernel "$kernel" -initrd "$initrd" -append "console=ttyS0 panic=-1 quiet" 2>&1 | tr -d '\r' > "$log" || true
+  -kernel "$kernel" -initrd "$initrd" -append "console=ttyS0 panic=-1 quiet dnuma.test_native_pager=${DNUMA_TEST_NATIVE_PAGER:-0}" 2>&1 | tr -d '\r' > "$log" || true
 sed -n '/KTEST begin/,$p' "$log"
 grep -q "KTEST end: 0 failure" "$log" && ! grep -qE "BUG:|WARNING:|KASAN|Oops|sleeping function|suspicious RCU|circular locking" "$log"
 rc=$?; rm -f "$log"; exit $rc

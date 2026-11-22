@@ -41,6 +41,7 @@ bool KernelView::open(std::string* why) {
     ssize_t n;
     while ((n = read(fd.get(), buf, sizeof buf)) > 0) text.append(buf, size_t(n));
     int version = 0;
+    can_online_ = can_pin_ = false;
     for (const std::string& line : split(text, '\n')) {
         std::vector<std::string> f = split(line, ' ');
         if (f.size() != 2) continue;
@@ -48,6 +49,7 @@ bool KernelView::open(std::string* why) {
         else if (f[0] == "nr_cpu_ids") nr_cpu_ids_ = atoi(f[1].c_str());
         else if (f[0] == "user_hz") user_hz_ = atoi(f[1].c_str());
         else if (f[0] == "online") can_online_ = true;
+        else if (f[0] == "affinity_query" && f[1] == "1") can_pin_ = true;
     }
     if (version != 1 || nr_cpu_ids_ <= 0 || user_hz_ <= 0) {
         *why = format("%s speaks version %d of an interface this program knows as version 1", kPath, version);
@@ -81,6 +83,10 @@ void KernelView::set_task(pid_t pid, int cpu, bool running, uint64_t utime, uint
 
 void KernelView::set_online(bool on) {
     if (active() && can_online_) pending_.push_back(on ? "online on\n" : "online off\n");
+}
+
+void KernelView::report_pin(pid_t tid, int cpu) {
+    if (active() && can_pin_) pending_.push_back(format("pin %d %d\n", int(tid), cpu));
 }
 
 void KernelView::del_task(pid_t pid) {

@@ -1,0 +1,193 @@
+Subject: [PATCH] userfaultfd: support native address spaces on the dnuma master
+
+Bind a privileged pager to the mm selected by a pidfd. Permit invalidation
+of registered private anonymous pages on that same descriptor. Keep the
+normal userfaultfd creation paths and stock slave kernels compatible.
+
+diff --git a/mm/Kconfig b/mm/Kconfig
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1364,6 +1364,14 @@
+ 	  area from being merged with adjacent virtual memory areas due to the
+ 	  difference in their name.
+ 
++config DNUMA_NATIVE_PAGER
++	bool "Allow the dnuma master to page native processes"
++	depends on X86_64 && USERFAULTFD && HAVE_ARCH_USERFAULTFD_WP
++	help
++	  Allow a privileged external pager to obtain a userfaultfd for a
++	  process via pidfd and revoke private anonymous pages registered
++	  on the descriptor. Only the dnuma master needs this option.
++
+ config HAVE_ARCH_USERFAULTFD_WP
+ 	bool
+ 	help
+diff --git a/include/uapi/linux/userfaultfd.h b/include/uapi/linux/userfaultfd.h
+--- a/include/uapi/linux/userfaultfd.h
++++ b/include/uapi/linux/userfaultfd.h
+@@ -15,6 +15,16 @@
+ /* ioctls for /dev/userfaultfd */
+ #define USERFAULTFD_IOC 0xAA
+ #define USERFAULTFD_IOC_NEW _IO(USERFAULTFD_IOC, 0x00)
++
++/* Private dnuma master ABI (CONFIG_DNUMA_NATIVE_PAGER). */
++struct dnuma_uffd_target {
++	__s32 pidfd;
++	__u32 flags;
++};
++
++#define DNUMA_UFFD_ATTACH _IOW(0xd7, 0x01, struct dnuma_uffd_target)
++#define DNUMA_UFFD_EVICT  _IOW(0xd7, 0x02, struct uffdio_range)
++
+ 
+ /*
+  * If the UFFDIO_API is upgraded someday, the UFFDIO_UNREGISTER and
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -23,6 +23,8 @@
+ #include <linux/sched/mm.h>
+ #include <linux/mm_inline.h>
+ #include <linux/poll.h>
++#include <linux/pid.h>
++#include <linux/ptrace.h>
+ #include <linux/slab.h>
+ #include <linux/seq_file.h>
+ #include <linux/bug.h>
+@@ -4659,6 +4661,52 @@
+ 	goto out;
+ }
+ 
++#ifdef CONFIG_DNUMA_NATIVE_PAGER
++static int dnuma_uffd_evict(struct userfaultfd_ctx *ctx, unsigned long arg)
++{
++	struct mm_struct *mm = ctx->mm;
++	struct vm_area_struct *vma;
++	struct uffdio_range range;
++	int ret;
++
++	if (!capable(CAP_SYS_PTRACE))
++		return -EPERM;
++	if (copy_from_user(&range, (void __user *)arg, sizeof(range)))
++		return -EFAULT;
++	ret = validate_range(mm, range.start, range.len);
++	if (ret)
++		return ret;
++	if (!mmget_not_zero(mm))
++		return -ESRCH;
++
++	mmap_write_lock(mm);
++	ret = -EINVAL;
++	vma = vma_lookup(mm, range.start);
++	if (!vma || range.len > vma->vm_end - range.start ||
++	    vma->vm_userfaultfd_ctx.ctx != ctx || !userfaultfd_missing(vma) ||
++	    !vma_is_anonymous(vma) ||
++	    (vma->vm_flags & (VM_SHARED | VM_LOCKED | VM_HUGETLB | VM_PFNMAP | VM_IO)))
++		goto out;
++
++	/* No access can pass these PTEs after the TLB shootdown returns.
++	 * The existing registration makes subsequent loads fault as missing.
++	 */
++	vma_start_write(vma);
++	down_read(&ctx->map_changing_lock);
++	if (atomic_read(&ctx->mmap_changing)) {
++		ret = -EAGAIN;
++	} else {
++		zap_vma_range(vma, range.start, range.len);
++		ret = 0;
++	}
++	up_read(&ctx->map_changing_lock);
++out:
++	mmap_write_unlock(mm);
++	mmput(mm);
++	return ret;
++}
++#endif
++
+ static long userfaultfd_ioctl(struct file *file, unsigned cmd,
+ 			      unsigned long arg)
+ {
+@@ -4669,6 +4717,10 @@
+ 		return -EINVAL;
+ 
+ 	switch (cmd) {
++#ifdef CONFIG_DNUMA_NATIVE_PAGER
++	case DNUMA_UFFD_EVICT:
++		return dnuma_uffd_evict(ctx, arg);
++#endif
+ 	case UFFDIO_API:
+ 		ret = userfaultfd_api(ctx, arg);
+ 		break;
+@@ -4760,11 +4812,11 @@
+ 	seqcount_spinlock_init(&ctx->refile_seq, &ctx->fault_pending_wqh.lock);
+ }
+ 
+-static int new_userfaultfd(int flags)
++static int new_userfaultfd(int flags, struct mm_struct *mm)
+ {
+ 	struct userfaultfd_ctx *ctx __free(kfree) = NULL;
+ 
+-	VM_WARN_ON_ONCE(!current->mm);
++	VM_WARN_ON_ONCE(!mm);
+ 
+ 	/* Check the UFFD_* constants for consistency. */
+ 	BUILD_BUG_ON(UFFD_USER_MODE_ONLY & UFFD_SHARED_FCNTL_FLAGS);
+@@ -4782,7 +4834,7 @@
+ 	ctx->released = false;
+ 	init_rwsem(&ctx->map_changing_lock);
+ 	atomic_set(&ctx->mmap_changing, 0);
+-	ctx->mm = current->mm;
++	ctx->mm = mm;
+ 
+ 	FD_PREPARE(fdf, flags & UFFD_SHARED_FCNTL_FLAGS,
+ 		   anon_inode_create_getfile("[userfaultfd]", &userfaultfd_fops, ctx,
+@@ -4820,15 +4872,46 @@
+ 	if (!userfaultfd_syscall_allowed(flags))
+ 		return -EPERM;
+ 
+-	return new_userfaultfd(flags);
+-}
++	return new_userfaultfd(flags, current->mm);
++}
++
++#ifdef CONFIG_DNUMA_NATIVE_PAGER
++static int dnuma_uffd_attach(unsigned long arg)
++{
++	struct dnuma_uffd_target target;
++	struct task_struct *task;
++	struct mm_struct *mm;
++	unsigned int flags;
++	int fd;
++
++	if (!capable(CAP_SYS_PTRACE))
++		return -EPERM;
++	if (copy_from_user(&target, (void __user *)arg, sizeof(target)))
++		return -EFAULT;
++	task = pidfd_get_task(target.pidfd, &flags);
++	if (IS_ERR(task))
++		return PTR_ERR(task);
++	mm = mm_access(task, PTRACE_MODE_ATTACH_REALCREDS);
++	put_task_struct(task);
++	if (IS_ERR(mm))
++		return PTR_ERR(mm);
++	/* Stay bound to this mm across target exec, exit and PID reuse. */
++	fd = new_userfaultfd(target.flags, mm);
++	mmput(mm);
++	return fd;
++}
++#endif
+ 
+ static long userfaultfd_dev_ioctl(struct file *file, unsigned int cmd, unsigned long flags)
+ {
++#ifdef CONFIG_DNUMA_NATIVE_PAGER
++	if (cmd == DNUMA_UFFD_ATTACH)
++		return dnuma_uffd_attach(flags);
++#endif
+ 	if (cmd != USERFAULTFD_IOC_NEW)
+ 		return -EINVAL;
+ 
+-	return new_userfaultfd(flags);
++	return new_userfaultfd(flags, current->mm);
+ }
+ 
+ static const struct file_operations userfaultfd_dev_fops = {

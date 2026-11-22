@@ -56,6 +56,13 @@ wait $p; expect "sha256sum exit code" "$?" "0"
 expect "digest computed while exported" "$(cut -d' ' -f1 "$OUT/4.out")" "$want"
 expect "sha256sum was exported before it finished" "$exported" "0"
 
+say "5. remote CPU selection and read-mostly native pages"
+target=$($CTL slave status "$SLAVE" | awk '/^Cluster CPUs:/ {split($3, r, "-"); print r[2]}')
+$T/n_readmostly "$target" > "$OUT/5.out" 2>&1 & p=$!
+check "native pager test initialized" wait_line "$OUT/5.out" '^READY$' 5
+check "place on the requested CPU" $CTL export "$p" --cpu "$target"
+wait "$p"; expect "read-only protections, dirty-page count, CPU, recall" "$?" "0"
+
 m=$($CTL metrics)
 val() { echo "$m" | awk -v k="$1" '$1==k {gsub(",","",$2); print $2; exit}'; }
 check "syscalls were forwarded to the master ($(val export_syscalls))" test "$(val export_syscalls)" -gt 100

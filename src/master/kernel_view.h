@@ -45,6 +45,8 @@ public:
     // then can_set_online() is false and set_online() does nothing.
     bool can_set_online() const { return can_online_; }
     void set_online(bool on);
+    bool can_report_pin() const { return can_pin_; }
+    void report_pin(pid_t tid, int cpu);
     void del_task(pid_t pid);
     void flush();
 
@@ -53,7 +55,7 @@ public:
 private:
     Fd fd_;
     int nr_cpu_ids_ = 0, user_hz_ = 100;
-    bool can_online_ = false;
+    bool can_online_ = false, can_pin_ = false;
     std::vector<std::string> pending_; // one whole command each
     uint64_t errors_ = 0;
 };

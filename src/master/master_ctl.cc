@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // dnumactl command handling. Output is rendered here, from live state.
+#include <charconv>
 #include <cinttypes>
 
 #include <sys/epoll.h>
@@ -43,7 +44,7 @@ const char* kUsage =
     "  dnumactl memory status [--slave <name>]\n"
     "  dnumactl process list [--slave <name>]\n"
     "  dnumactl metrics [--slave <name>]\n"
-    "  dnumactl export <pid> [<slave>]             move a running process's execution to a slave\n"
+    "  dnumactl export <pid> [<slave>] [--cpu <cluster-cpu>]     move execution to a slave CPU\n"
     "  dnumactl recall <pid> | --all               bring exported processes home\n"
     "  dnumactl fault <name> <what> [<arg>]        (fault injection, for testing)\n";
 } // namespace
@@ -152,10 +153,25 @@ void Master::on_ctl_request(CtlPtr ctl, const std::vector<std::string>& args_in)
     }
     if (cmd == "export" && args.size() >= 2) {
         std::string why;
-        Slave* s = export_target(args.size() >= 3 ? args[2] : "", &why);
+        std::string cpu_arg;
+        int cpu = -1;
+        if (take_opt(args, "--cpu", &cpu_arg)) {
+            auto [end, err] = std::from_chars(cpu_arg.data(), cpu_arg.data() + cpu_arg.size(), cpu);
+            if (err != std::errc() || end != cpu_arg.data() + cpu_arg.size() || cpu < 0)
+                return fail("expected a nonnegative cluster CPU number");
+        }
+        if (args.size() < 2 || args.size() > 3) return fail(kUsage);
+        std::string name = args.size() == 3 ? args[2] : "";
+        if (cpu >= 0 && name.empty()) {
+            for (const auto& [n, agent] : slaves_)
+                if (agent->state == SlaveState::Active && cpu >= agent->cpu_base &&
+                    cpu - agent->cpu_base < agent->res.cpus_online) { name = n; break; }
+            if (name.empty()) return fail("CPU is not offered by an active slave");
+        }
+        Slave* s = export_target(name, &why, cpu < 0);
         if (!s) return fail("cannot export: " + why);
         pid_t pid = atoi(args[1].c_str());
-        Status st = export_pid(pid, *s);
+        Status st = export_pid(pid, *s, cpu >= 0 ? ExportPlacement::SelectCpu : ExportPlacement::SelectSlave, cpu);
         if (!st.is_ok()) return fail(format("cannot export pid %d: %s", pid, st.str().c_str()));
         ctl->out(format("pid %d is being moved to %s (see `dnumactl process list`)\n", pid, s->name.c_str()));
         return ctl->done(0);
@@ -240,6 +256,8 @@ std::string Master::render_slave_status(Slave& s) {
     if (s.res.nodes.empty()) return out;
 
     UffdCaps uc = uffd_caps_from_features(s.res.uffd_features, s.res.uffd_dev);
+    if (s.state == SlaveState::Active && s.export_block.empty())
+        out += format("Cluster CPUs: %d-%d\n", s.cpu_base, s.cpu_base + s.res.cpus_online - 1);
     out += format("Kernel:       %s\nCPU:          %s, %d socket(s), %d CPUs\nMemory:       %s total, %s available\n",
                   s.res.kernel.c_str(), s.res.cpu_model.c_str(), s.res.sockets, s.res.cpus_online,
                   human_bytes(s.res.mem_total).c_str(), human_bytes(s.res.mem_available).c_str());

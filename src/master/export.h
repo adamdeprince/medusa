@@ -35,13 +35,16 @@
 
 namespace dnuma {
 
+enum class ExportPlacement { Balance, SelectSlave, SelectCpu };
+
 class ExportManager {
 public:
     struct Hooks {
         std::function<void(MachineId, Msg)> send;          // operations channel to a slave
         std::function<std::string(MachineId)> machine_name;
+        std::function<void(uint64_t, pid_t, int, bool)> on_ready;          // agent has applied CPU affinity
         // Called whenever an export ends (for drain progress and accounting).
-        std::function<void(MachineId, pid_t)> on_end;
+        std::function<void(uint64_t, MachineId, pid_t)> on_end;
     };
     struct Info {
         uint64_t xid;
@@ -64,7 +67,7 @@ public:
 
     // Starts exporting `pid` to `machine`. `cpu`/`node` are how it is
     // presented; `local_cpu` is the slave CPU it is pinned to.
-    Status start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu);
+    Status start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu, ExportPlacement placement);
     // Brings one exported process home. `pin` keeps it from being picked again.
     Status recall(pid_t pid, const std::string& why, bool pin);
     void recall_all(MachineId machine, const std::string& why);
@@ -119,6 +122,7 @@ private:
         uint64_t args[6] = {};
         std::vector<OutPlan> outs;
         // Coming home.
+        bool explicit_cpu = false;  // admin requested this CPU for the export
         bool stopped = false;       // P is in a ptrace stop right now
         bool group_stop = false;
         bool mid_syscall = false;   // stopped by a signal inside the injected call

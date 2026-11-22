@@ -9,8 +9,14 @@ cp /usr/bin/busybox $d/bin/busybox
 for a in sh mount cat grep awk sed sleep ls dd md5sum wc printf kill touch uname dmesg sync poweroff tr seq head; do ln -s busybox $d/bin/$a; done
 cp /usr/bin/top /usr/bin/ps $d/bin/
 client=${DNUMA_BUILD:-$here/../../build}/tests/test_kernel_view
-cp $client $d/bin/
-for b in /usr/bin/top /usr/bin/ps $client; do
+pager=${DNUMA_BUILD:-$here/../../build}/tests/n_native_pager
+cp "$client" "$d/bin/"
+if [ "${DNUMA_TEST_NATIVE_PAGER:-0}" = 1 ] || [ -x "$pager" ]; then
+  cp "$pager" "$d/bin/"
+fi
+if [ -n "${DNUMA_GO_HEAP:-}" ]; then cp "$DNUMA_GO_HEAP" "$d/bin/n_go_heap"; fi
+for b in /usr/bin/top /usr/bin/ps "$client" "$d/bin/n_native_pager"; do
+  [ -x "$b" ] || continue
   ldd $b | awk '$3 ~ /^\// {print $3} $1 ~ /^\/lib/ {print $1}' | while read l; do mkdir -p $d$(dirname $l); cp -L $l $d$l; done
 done
 cp /usr/share/terminfo/d/dumb $d/usr/share/terminfo/d/ 2>/dev/null || cp /lib/terminfo/d/dumb $d/usr/share/terminfo/d/

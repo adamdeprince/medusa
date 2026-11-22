@@ -31,6 +31,7 @@ struct Copy {
 struct Envelope {
     MsgType type;
     PageMsg msg;
+    CtxId ctx = 0;
 };
 
 struct Sim : CoherenceIo {
@@ -44,6 +45,10 @@ struct Sim : CoherenceIo {
     std::vector<std::deque<Envelope>> down, up;   // master->machine, machine->master
     std::map<PageNo, uint64_t> expected;          // latest value written to each page
     std::vector<std::string> failures;            // coherence_failure() reports
+    std::vector<std::pair<CtxId, CtxId>> handoffs;
+    void page_handoff(ProcId, CtxId ctx, MachineId, CtxId peer, MachineId, uint64_t) override {
+        handoffs.emplace_back(ctx, peer);
+    }
     int violations = 0;
     int fail_parked_grants = 0;                   // inject: next N migration grants fail
     std::set<MachineId> remote_sources;           // machines pages were pulled from
@@ -69,7 +74,7 @@ struct Sim : CoherenceIo {
     }
 
     // ---- node behaviour ----
-    void request(MachineId m, PageNo page, Access need) {
+    void request(MachineId m, PageNo page, Access need, CtxId ctx = 0) {
         Copy& c = mem[m][page];
         if (int(c.right) >= int(need) || int(c.requested) >= int(need)) return;
         c.requested = need;
@@ -77,7 +82,7 @@ struct Sim : CoherenceIo {
         rq.proc = kProc;
         rq.page = page;
         rq.access = need;
-        up[m].push_back({MsgType::PageRequest, rq});
+        up[m].push_back({MsgType::PageRequest, rq, ctx});
     }
 
     void node_handle(MachineId m, const Envelope& e) {
@@ -148,7 +153,7 @@ struct Sim : CoherenceIo {
     }
 
     void master_handle(MachineId from, const Envelope& e) {
-        if (e.type == MsgType::PageRequest) coh.on_request(from, e.msg);
+        if (e.type == MsgType::PageRequest) coh.on_request(from, e.msg, e.ctx);
         else if (e.type == MsgType::PageRevoked) coh.on_revoked(from, e.msg);
         else coh.on_complete(from, e.msg);
     }
@@ -271,6 +276,31 @@ TEST(random_interleavings_four_machines) {
         // Pages moved between slaves directly, not only via the master.
         CHECK(s.remote_sources.size() >= 3);
     }
+}
+
+TEST(read_replication_does_not_vote_for_thread_migration) {
+    Sim s(3, 1);
+    const PageNo p = s.first;
+    s.request(0, p, Access::Write, 11);
+    s.settle();
+    s.local_write(0, p);
+    s.request(1, p, Access::Read, 12);
+    s.settle();
+    s.request(2, p, Access::Read, 13);
+    s.settle();
+    CHECK(s.handoffs.empty());
+    auto transfers = s.metrics.get("page_transfers");
+    s.request(1, p, Access::Write, 12);
+    s.settle();
+    CHECK_EQ(s.handoffs.size(), size_t(1));
+    if (!s.handoffs.empty()) CHECK(s.handoffs.front().first == 12 && s.handoffs.front().second == 13);
+    CHECK_EQ(s.metrics.get("page_transfers"), transfers);
+    s.local_write(1, p);
+    s.request(0, p, Access::Read, 11);
+    s.settle();
+    CHECK_EQ(s.mem[0][p].value, 2u);
+    CHECK_EQ(s.handoffs.size(), size_t(1));
+    CHECK_EQ(s.violations, 0);
 }
 
 TEST(write_waits_for_every_other_copy) {
@@ -530,6 +560,37 @@ TEST(populate_and_rehome) {
     s.coh.lookup(Sim::kProc, s.first, &home);
     CHECK_EQ(home, 9u);
     CHECK_EQ(s.coh.allocated_pages(Sim::kProc), 8u);
+}
+
+TEST(native_mapping_preserves_bytes_and_allocates_metadata_on_first_touch) {
+    Sim s(2, 1);
+    const ProcId id = Sim::kProc;
+    s.coh.destroy_space(id);
+    const PageNo first = 0x1000000;
+    const uint64_t count = 1ull << 28; // a 1 TiB reserved address range
+    s.coh.create_space(id, 0, page_of(UINT64_MAX) + 1);
+    CHECK(s.coh.register_native_region(id, first, count, 2).is_ok());
+    CHECK_EQ(s.coh.register_native_region(id, first + 1, count, 2).code(), EEXIST);
+    CHECK_EQ(s.coh.register_native_region(id, first - 1, 2, 2).code(), EEXIST);
+    CHECK_EQ(s.coh.register_native_region(id, page_of(UINT64_MAX), 2, 2).code(), EINVAL);
+    PageNo page = first + count - 1;
+    CHECK_EQ(s.coh.lookup(id, page)->owner, kMasterMachine);
+    s.coh.for_each_region(id, [&](const Region& r) { CHECK(r.pages.empty()); });
+    s.mem[0][page].right = Access::Write;
+    s.mem[0][page].value = s.expected[page] = 73;
+    s.request(1, page, Access::Read);
+    s.settle();
+    CHECK_EQ(s.mem[1][page].value, 73u);
+    s.coh.for_each_region(id, [&](const Region& r) { CHECK_EQ(r.pages.size(), 1u); });
+    int completed = 0;
+    s.coh.free_region(id, first, [&](Status st) { CHECK(st.is_ok()); ++completed; });
+    s.request(1, first, Access::Write); // a previously untouched page during free
+    s.settle();
+    CHECK_EQ(completed, 1);
+    CHECK(!s.coh.lookup(id, first));
+    CHECK_EQ(s.coh.usage(1).resident, 0u);
+    CHECK_EQ(s.coh.usage(kMasterMachine).resident, 0u);
+    CHECK(s.mem[1][first].right == Access::None);
 }
 
 UTEST_MAIN()

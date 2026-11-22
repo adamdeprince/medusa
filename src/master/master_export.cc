@@ -45,10 +45,11 @@ void Master::export_init() {
     ExportManager::Hooks h;
     h.send = [this](MachineId m, Msg msg) { send_to_machine(m, std::move(msg)); };
     h.machine_name = [this](MachineId m) { return machine_name(m); };
-    h.on_end = [this](MachineId m, pid_t pid) {
+    h.on_ready = [this](uint64_t xid, pid_t pid, int cpu, bool pinned) { view_task_started(xid, pid, cpu, pinned); };
+    h.on_end = [this](uint64_t xid, MachineId m, pid_t pid) {
         // Deferred: the manager is in the middle of forgetting the export.
-        reactor_.post([this, m, pid] {
-            view_task_ended(pid);
+        reactor_.post([this, xid, m, pid] {
+            view_task_ended(xid, pid);
             Slave* s = slave_by_machine(m);
             if (s && s->state == SlaveState::Draining) drain_step(m);
             if (shutdown_done_ && exports_ && exports_->count() == 0) {
@@ -137,7 +138,7 @@ void Master::export_slave_attached(Slave& s) {
         LOG_WARN("slave %s cannot execute native processes: %s", s.name.c_str(), s.export_block.c_str());
 }
 
-Slave* Master::export_target(const std::string& name, std::string* why) {
+Slave* Master::export_target(const std::string& name, std::string* why, bool require_idle) {
     Slave* best = nullptr;
     size_t best_free = 0;
     for (auto& [n, s] : slaves_) {
@@ -152,7 +153,7 @@ Slave* Master::export_target(const std::string& name, std::string* why) {
         }
         size_t used = exports_->count(s->machine);
         size_t free = size_t(s->res.cpus_online) > used ? size_t(s->res.cpus_online) - used : 0;
-        if (free == 0) {
+        if (require_idle && free == 0) {
             *why = n + " has no idle CPU";
             continue;
         }
@@ -174,27 +175,27 @@ int Master::export_pick_cpu(Slave& s) {
     return int(std::min_element(load.begin(), load.end()) - load.begin());
 }
 
-Status Master::export_pid(pid_t pid, Slave& s) {
+Status Master::export_pid(pid_t pid, Slave& s, ExportPlacement placement, int cluster_cpu) {
     if (pid <= 1 || pid == getpid()) return Status::err(EINVAL, "not a process that can be exported");
     for (auto& [id, p] : procs_)
         if (p.home_pid == pid) return Status::err(EINVAL, "is a dnuma-run program (it places its own threads)");
-    int idx = export_pick_cpu(s);
+    if (cluster_cpu >= 0 && (cluster_cpu < s.cpu_base || cluster_cpu - s.cpu_base >= s.res.cpus_online))
+        return Status::err(EINVAL, "CPU %d does not belong to %s", cluster_cpu, s.name.c_str());
+    int idx = cluster_cpu >= 0 ? cluster_cpu - s.cpu_base : export_pick_cpu(s);
     // Map the CPU index to the slave's actual CPU number and NUMA node.
-    int local_cpu = -1, logical_node = -1, seen = 0;
+    int local_cpu = -1, logical_node = -1;
     std::vector<int> cpus;
     for (const auto& n : s.res.nodes)
         for (int c : n.cpus) cpus.push_back(c);
     std::sort(cpus.begin(), cpus.end());
-    if (idx < int(cpus.size())) local_cpu = cpus[size_t(idx)];
+    if (idx < 0 || size_t(idx) >= cpus.size()) return Status::err(ENODEV, "CPU missing from agent topology");
+    local_cpu = cpus[size_t(idx)];
     for (const auto& n : s.res.nodes) {
         if (std::find(n.cpus.begin(), n.cpus.end(), local_cpu) != n.cpus.end())
             for (const auto& a : s.nodes)
                 if (a.phys_index == n.phys_index) logical_node = a.logical;
-        ++seen;
     }
-    Status st = exports_->start(pid, s.machine, s.cpu_base + idx, logical_node, local_cpu);
-    if (st.is_ok()) view_task_started(pid, s.cpu_base + idx);
-    return st;
+    return exports_->start(pid, s.machine, s.cpu_base + idx, logical_node, local_cpu, placement);
 }
 
 // The balancer: when this machine has more runnable work than CPUs and a
@@ -252,7 +253,7 @@ void Master::export_tick() {
         if (moved >= over) break;
         Slave* s = export_target("", &why);
         if (!s) break;
-        Status st = export_pid(pid, *s);
+        Status st = export_pid(pid, *s, ExportPlacement::Balance);
         if (st.is_ok()) {
             ++moved;
             metrics_.add("exports_by_balancer");

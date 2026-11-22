@@ -86,9 +86,12 @@ private:
         int cpu = -1, node = -1;
         std::map<uint64_t, XVma> vmas;                  // by start address
         std::unordered_map<uint64_t, uint8_t> pages;    // page address -> 1 clean, 2 modified
-        std::unordered_map<uint64_t, uint32_t> requested; // request start -> page count
-        std::unordered_map<uint64_t, uint64_t> req_t0;    // request start -> time sent
-        std::unordered_map<uint64_t, bool> req_write;     // request start -> triggered by a write
+        struct PageRequest {
+            uint32_t count;
+            uint64_t sent_ns;
+            bool write_fault;
+        };
+        std::map<uint64_t, PageRequest> requested;       // nonoverlapping in-flight ranges
         uint64_t sys_t0 = 0, stop_t0 = 0;
         St st = St::Running;
         user_regs_struct sregs{};                       // registers at the pending system call
@@ -130,7 +133,7 @@ private:
     bool range_writable(Body& b, uint64_t addr, uint64_t len);
     void vma_remove(Body& b, uint64_t start, uint64_t end);
     Status map_vma(Body& b, const XVma& v);
-    void mark_dirty(Body& b, uint64_t page);
+    Status mark_dirty(Body& b, uint64_t page);
     Status inject(Body& b, long nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, long* ret);
     uint64_t cpu_time_ns(Body& b);
 

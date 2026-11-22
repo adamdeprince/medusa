@@ -14,6 +14,13 @@ namespace {
 bool contains(const std::vector<MachineId>& v, MachineId m) {
     return std::find(v.begin(), v.end(), m) != v.end();
 }
+template <typename Regions>
+auto covering(Regions& regions, PageNo page) {
+    auto it = regions.upper_bound(page);
+    if (it == regions.begin()) return regions.end();
+    --it;
+    return page - it->first < it->second.count ? it : regions.end();
+}
 bool exports(RevokeMode m) { return m != RevokeMode::Invalidate; }
 std::string readers_str(const std::vector<MachineId>& r) {
     std::string s = "{";
@@ -70,6 +77,8 @@ Status Coherence::allocate(ProcId proc, uint64_t npages, NodeId home, PageNo* fi
     Space* sp = space(proc);
     if (!sp) return Status::err(ESRCH, "no such process");
     if (npages == 0) return Status::err(EINVAL, "empty allocation");
+    if (sp->first > page_of(UINT64_MAX) || sp->count > page_of(UINT64_MAX) + 1 - sp->first)
+        return Status::err(EOVERFLOW, "address space exceeds virtual address range");
     // First fit over the gaps between existing regions.
     PageNo cursor = sp->first;
     PageNo end = sp->first + sp->count;
@@ -83,29 +92,60 @@ Status Coherence::allocate(ProcId proc, uint64_t npages, NodeId home, PageNo* fi
     rg.first = cursor;
     rg.count = npages;
     rg.home = home;
-    rg.pages.resize(npages);
-    sp->regions.emplace(cursor, std::move(rg));
+    try {
+        sp->regions.emplace(cursor, std::move(rg));
+    } catch (const std::bad_alloc&) {
+        return Status::err(ENOMEM, "cannot allocate region metadata");
+    }
     *first = cursor;
+    return Status::ok();
+}
+
+Status Coherence::register_native_region(ProcId proc, PageNo first, uint64_t count, NodeId home) {
+    Space* sp = space(proc);
+    if (!sp) return Status::err(ESRCH, "no such process");
+    if (!count || first > page_of(UINT64_MAX) || count - 1 > page_of(UINT64_MAX) - first ||
+        first < sp->first || first - sp->first >= sp->count || count > sp->count - (first - sp->first))
+        return Status::err(EINVAL, "native mapping outside the address space");
+    auto next = sp->regions.lower_bound(first);
+    if ((next != sp->regions.end() && next->first - first < count) || covering(sp->regions, first) != sp->regions.end())
+        return Status::err(EEXIST, "native mapping overlaps a registered region");
+    Region rg;
+    rg.first = first;
+    rg.count = count;
+    rg.home = home;
+    rg.initial.state = PageState::Exclusive;
+    rg.initial.owner = kMasterMachine;
+    try {
+        sp->regions.emplace_hint(next, first, std::move(rg));
+    } catch (const std::bad_alloc&) {
+        return Status::err(ENOMEM, "cannot allocate native mapping metadata");
+    }
     return Status::ok();
 }
 
 PageEntry* Coherence::entry(ProcId proc, PageNo page, Region** region) {
     Space* sp = space(proc);
     if (!sp) return nullptr;
-    auto it = sp->regions.upper_bound(page);
-    if (it == sp->regions.begin()) return nullptr;
-    --it;
+    auto it = covering(sp->regions, page);
+    if (it == sp->regions.end()) return nullptr;
     Region& rg = it->second;
-    if (page >= rg.first + rg.count) return nullptr;
     if (region) *region = &rg;
-    return &rg.pages[page - rg.first];
+    if (rg.releasing && !rg.pages.count(page)) return nullptr;
+    auto [p, fresh] = rg.pages.try_emplace(page, rg.initial);
+    if (fresh) account(*sp, p->second, +1);
+    return &p->second;
 }
 
 const PageEntry* Coherence::lookup(ProcId proc, PageNo page, NodeId* home) const {
-    Region* rg = nullptr;
-    PageEntry* e = const_cast<Coherence*>(this)->entry(proc, page, &rg);
-    if (e && home) *home = rg->home;
-    return e;
+    const Space* sp = space(proc);
+    if (!sp) return nullptr;
+    auto it = covering(sp->regions, page);
+    if (it == sp->regions.end()) return nullptr;
+    const Region& rg = it->second;
+    if (home) *home = rg.home;
+    auto p = rg.pages.find(page);
+    return p == rg.pages.end() ? &rg.initial : &p->second;
 }
 
 void Coherence::set_region_home(ProcId proc, PageNo region_first, NodeId home) {
@@ -140,6 +180,8 @@ void Coherence::set_state(ProcId proc, Space& sp, PageNo page, PageEntry& e, Pag
     e.owner = (st == PageState::Unbacked || st == PageState::Lost) ? kNoMachine : owner;
     e.readers = (st == PageState::Shared) ? std::move(readers) : std::vector<MachineId>{};
     e.gen = gen;
+    e.last_ctx = 0;
+    e.last_machine = kNoMachine;
     account(sp, e, +1);
     metrics_.add("page_ownership_transitions");
     PAGE_TRACE("PAGE dir proc=%" PRIu64 " page=0x%" PRIx64 " %s(owner=%d) -> %s(owner=%d readers=%s) gen=%" PRIu64 " cause=%s",
@@ -151,8 +193,9 @@ void Coherence::mark_populated(ProcId proc, PageNo first, uint64_t count, Machin
     Space* sp = space(proc);
     if (!sp) return;
     for (uint64_t i = 0; i < count; ++i) {
-        PageEntry* e = entry(proc, first + i);
-        if (!e || e->busy || e->state != PageState::Unbacked) continue;
+        Region* rg = nullptr;
+        PageEntry* e = entry(proc, first + i, &rg);
+        if (!e || rg->releasing || e->busy || e->state != PageState::Unbacked) continue;
         set_state(proc, *sp, first + i, *e, PageState::Exclusive, owner, {}, e->gen + 1, "populate");
     }
 }
@@ -234,19 +277,20 @@ void Coherence::defer_or_run(ProcId proc, PageNo page, std::function<void()> fn)
     else fn();
 }
 
-void Coherence::on_request(MachineId from, const PageMsg& m) {
+void Coherence::on_request(MachineId from, const PageMsg& m, CtxId ctx) {
     metrics_.add("page_fault_requests");
     ProcId proc = m.proc;
     PageNo page = m.page;
     Access access = m.access;
-    defer_or_run(proc, page, [this, from, proc, page, access] { start_fault(from, proc, page, access); });
+    defer_or_run(proc, page, [this, from, proc, page, access, ctx] { start_fault(from, proc, page, access, ctx); });
 }
 
-void Coherence::start_fault(MachineId from, ProcId proc, PageNo page, Access access) {
+void Coherence::start_fault(MachineId from, ProcId proc, PageNo page, Access access, CtxId ctx) {
     Space* sp = space(proc);
     if (!sp || !io_.machine_usable(from)) return;
-    PageEntry* e = entry(proc, page);
-    if (!e) {
+    Region* rg = nullptr;
+    PageEntry* e = entry(proc, page, &rg);
+    if (!e || rg->releasing) {
         // Inside the reserved range but not allocated: the node raises SIGSEGV.
         PageMsg g;
         g.proc = proc;
@@ -256,7 +300,7 @@ void Coherence::start_fault(MachineId from, ProcId proc, PageNo page, Access acc
         return;
     }
     if (e->busy) {
-        txns_[Key{proc, page}].deferred.push_back([this, from, proc, page, access] { start_fault(from, proc, page, access); });
+        txns_[Key{proc, page}].deferred.push_back([this, from, proc, page, access, ctx] { start_fault(from, proc, page, access, ctx); });
         return;
     }
     switch (e->state) {
@@ -266,6 +310,7 @@ void Coherence::start_fault(MachineId from, ProcId proc, PageNo page, Access acc
     case PageState::Unbacked: {
         // First touch: the toucher becomes exclusive owner of a zero page.
         Txn& t = begin(proc, page, *e, Kind::Fault, from);
+        t.ctx = ctx;
         t.access = Access::Write;
         t.grant_source = GrantSource::Zero;
         t.new_state = PageState::Exclusive;
@@ -276,6 +321,7 @@ void Coherence::start_fault(MachineId from, ProcId proc, PageNo page, Access acc
     case PageState::Exclusive: {
         MachineId owner = e->owner;
         Txn& t = begin(proc, page, *e, Kind::Fault, from);
+        t.ctx = ctx;
         if (owner == from) {
             t.access = Access::Write;
             t.grant_source = GrantSource::Local;
@@ -305,6 +351,7 @@ void Coherence::start_fault(MachineId from, ProcId proc, PageNo page, Access acc
         std::vector<MachineId> readers = e->readers;
         bool holds = from == owner || contains(readers, from);
         Txn& t = begin(proc, page, *e, Kind::Fault, from);
+        t.ctx = ctx;
         if (access == Access::Read) {
             t.access = Access::Read;
             t.new_state = PageState::Shared;
@@ -349,8 +396,9 @@ void Coherence::migrate(ProcId proc, PageNo page, MachineId dest, Done done) {
 }
 
 void Coherence::start_migrate(ProcId proc, PageNo page, MachineId dest, Done done) {
-    PageEntry* e = entry(proc, page);
-    if (!e) return done(Status::err(EFAULT, "page not allocated"));
+    Region* rg = nullptr;
+    PageEntry* e = entry(proc, page, &rg);
+    if (!e || rg->releasing) return done(Status::err(EFAULT, "page not allocated"));
     if (e->busy) {
         txns_[Key{proc, page}].deferred.push_back([this, proc, page, dest, done = std::move(done)]() mutable {
             start_migrate(proc, page, dest, std::move(done));
@@ -444,18 +492,33 @@ void Coherence::free_region(ProcId proc, PageNo first, Done done) {
     if (!sp) return done(Status::err(ESRCH, "no such process"));
     auto it = sp->regions.find(first);
     if (it == sp->regions.end()) return done(Status::err(EINVAL, "address is not the start of an allocation"));
-    uint64_t count = it->second.count;
-    auto remaining = std::make_shared<uint64_t>(count);
+    Region& rg = it->second;
+    if (rg.releasing) return done(Status::err(EBUSY, "allocation already being released"));
+    if (rg.pages.empty()) {
+        sp->regions.erase(it);
+        return done(Status::ok());
+    }
+    // A completion can synchronously erase the region. Walk an independent
+    // list and keep new first touches out while invalidations are in flight.
+    std::vector<PageNo> touched;
+    touched.reserve(rg.pages.size());
+    for (const auto& item : rg.pages) touched.push_back(item.first);
+    rg.releasing = true;
+    auto remaining = std::make_shared<size_t>(touched.size());
     auto first_err = std::make_shared<Status>();
     auto shared_done = std::make_shared<Done>(std::move(done));
-    for (uint64_t i = 0; i < count; ++i) {
-        PageNo page = first + i;
+    for (PageNo page : touched) {
         defer_or_run(proc, page, [this, proc, page, first, remaining, first_err, shared_done] {
             start_discard(proc, page, [this, proc, first, remaining, first_err, shared_done](Status st) {
                 if (!st.is_ok() && first_err->is_ok()) *first_err = st;
                 if (--*remaining != 0) return;
-                if (first_err->is_ok())
-                    if (Space* sp = space(proc)) sp->regions.erase(first);
+                if (Space* sp = space(proc)) {
+                    auto it = sp->regions.find(first);
+                    if (it != sp->regions.end()) {
+                        if (first_err->is_ok()) sp->regions.erase(it);
+                        else it->second.releasing = false;
+                    }
+                }
                 (*shared_done)(*first_err);
             });
         });
@@ -538,7 +601,15 @@ void Coherence::on_complete(MachineId from, const PageMsg& m) {
         if (t.source_staged) io_.send_page(t.source, MsgType::PageRelease, x);
         if (t.grant_source == GrantSource::Remote) metrics_.add("page_transfers");
         const char* cause = t.kind == Kind::Migrate ? "migrate" : (t.access == Access::Write ? "write-fault" : "read-fault");
+        CtxId previous = e->last_ctx;
+        MachineId peer = e->last_machine;
+        // Downgrading a writer so that others can read is ordinary replication.
+        // Only a new writer taking access away from a remote holder votes.
+        bool handoff = t.ctx && previous && t.ctx != previous && peer != from && t.access == Access::Write;
         set_state(m.proc, *sp, m.page, *e, t.new_state, t.new_owner, t.new_readers, t.gen, cause);
+        e->last_ctx = t.ctx;
+        e->last_machine = from;
+        if (handoff) io_.page_handoff(m.proc, t.ctx, from, previous, peer, now_ns() - t.t0);
         return finish(m.proc, m.page, Status::ok());
     }
 
@@ -619,10 +690,9 @@ void Coherence::for_each_page_on(MachineId m,
         auto u = sp.usage.find(m);
         if (u == sp.usage.end() || u->second.resident == 0) continue;
         for (const auto& [first, rg] : sp.regions)
-            for (uint64_t i = 0; i < rg.count; ++i) {
-                const PageEntry& e = rg.pages[i];
+            for (const auto& [page, e] : rg.pages) {
                 if (e.state != PageState::Exclusive && e.state != PageState::Shared) continue;
-                if (e.owner == m || contains(e.readers, m)) fn(proc, first + i, e);
+                if (e.owner == m || contains(e.readers, m)) fn(proc, page, e);
             }
     }
 }

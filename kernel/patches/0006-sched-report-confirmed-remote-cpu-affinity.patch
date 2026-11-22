@@ -1,0 +1,222 @@
+Subject: [PATCH] sched: report acknowledged remote CPU pins to sched_getaffinity
+
+An agent confirms its actual singleton Linux CPU affinity before the master
+publishes a pin. Report that effective CPU to users querying the home TID.
+Keep remote bit numbers out of scheduler cpumasks, retain the syscall's
+task permission checks, and clear the report when the task comes home.
+The local scheduler continues to own the home task's native mask.
+
+diff --git a/fs/proc/dnuma_view.c b/fs/proc/dnuma_view.c
+--- a/fs/proc/dnuma_view.c
++++ b/fs/proc/dnuma_view.c
+@@ -48,6 +48,7 @@
+  *                                    here. Times are totals consumed
+  *                                    remotely. Ignored if no such task
+  *                                    exists (any more).
++ *           pin <pid> <cpu>     confirm that its body is pinned to this CPU
+  *           task <pid> del
+  *           online <on|off>
+  *           clear
+@@ -99,6 +100,7 @@
+ 	struct rcu_head rcu;
+ 	struct pid *pid;		/* holds a reference */
+ 	int cpu;
++	int pinned_cpu;		/* acknowledged agent affinity, -1 at home */
+ 	bool running;
+ 	u64 utime, stime;
+ };
+@@ -144,6 +146,22 @@
+ 		seq_putc(p, '\n');
+ 	}
+ 	rcu_read_unlock();
++}
++
++int __dnuma_view_pinned_cpu(struct pid *pid)
++{
++	struct dv_task *t;
++	int cpu = -1;
++
++	rcu_read_lock();
++	hash_for_each_possible_rcu(dv_tasks, t, node, (unsigned long)pid) {
++		if (t->pid == pid) {
++			cpu = READ_ONCE(t->pinned_cpu);
++			break;
++		}
++	}
++	rcu_read_unlock();
++	return cpu;
+ }
+ 
+ void __dnuma_view_task(struct pid *pid, struct dnuma_view_task *out)
+@@ -293,6 +311,12 @@
+ 
+ static void dv_del_cpu(struct dv_cpu *c)
+ {
++	struct dv_task *t;
++	int bkt;
++
++	hash_for_each(dv_tasks, bkt, t, node)
++		if (t->pinned_cpu == c->id)
++			WRITE_ONCE(t->pinned_cpu, -1);
+ 	list_del_rcu(&c->list);
+ 	WRITE_ONCE(dv_nr_cpus, dv_nr_cpus - 1);
+ 	kvfree_rcu(c, rcu);
+@@ -398,6 +422,7 @@
+ 			return -ENOMEM;
+ 		}
+ 		t->pid = pid;	/* the entry keeps the reference */
++		t->pinned_cpu = -1;
+ 		t->cpu = cpu;
+ 		t->running = state == 'R';
+ 		t->utime = utime;
+@@ -407,11 +432,33 @@
+ 		return 0;
+ 	}
+ 	put_pid(pid);
++	if (cpu != t->cpu)
++		WRITE_ONCE(t->pinned_cpu, -1);
+ 	WRITE_ONCE(t->cpu, cpu);
+ 	WRITE_ONCE(t->running, state == 'R');
+ 	WRITE_ONCE(t->utime, utime);
+ 	WRITE_ONCE(t->stime, stime);
+ 	return 0;
++}
++
++static int dv_pin_task(pid_t nr, int cpu)
++{
++	struct pid *pid;
++	struct dv_task *t;
++	int err = 0;
++
++	if (cpu < 0 || !dv_find_cpu(cpu))
++		return -EINVAL;
++	pid = find_get_pid(nr);
++	if (!pid)
++		return 0;
++	t = dv_find_task(pid);
++	if (t && t->cpu == cpu)
++		WRITE_ONCE(t->pinned_cpu, cpu);
++	else if (pid_has_task(pid, PIDTYPE_PID))
++		err = -EINVAL;
++	put_pid(pid);
++	return err;
+ }
+ 
+ static void dv_del_task_nr(pid_t nr)
+@@ -493,6 +540,9 @@
+ 			WRITE_ONCE(c->stat[i], v[i]);
+ 		return 0;
+ 	}
++	n = 0;
++	if (sscanf(line, "pin %d %d%n", &pid, &cpu, &n) == 2 && n && !line[n])
++		return dv_pin_task(pid, cpu);
+ 	n = 0;
+ 	if (sscanf(line, "task %d del%n", &pid, &n) == 1 && n && !line[n]) {
+ 		dv_del_task_nr(pid);
+@@ -559,7 +609,7 @@
+ 
+ static int dv_show(struct seq_file *m, void *v)
+ {
+-	seq_printf(m, "version 1\nnr_cpu_ids %u\nuser_hz %d\ncpus %u\ntasks %u\nonline %d\n",
++	seq_printf(m, "version 1\nnr_cpu_ids %u\nuser_hz %d\ncpus %u\ntasks %u\nonline %d\naffinity_query 1\n",
+ 		   nr_cpu_ids, USER_HZ, READ_ONCE(dv_nr_cpus), READ_ONCE(dv_nr_tasks),
+ 		   READ_ONCE(dv_online));
+ 	return 0;
+diff --git a/include/linux/dnuma_view.h b/include/linux/dnuma_view.h
+--- a/include/linux/dnuma_view.h
++++ b/include/linux/dnuma_view.h
+@@ -35,6 +35,15 @@
+ 
+ /* True while a manager holds /proc/dnuma_view open for writing. */
+ DECLARE_STATIC_KEY_FALSE(dnuma_view_key);
++
++int __dnuma_view_pinned_cpu(struct pid *pid);
++
++static inline int dnuma_view_pinned_cpu(struct pid *pid)
++{
++	if (static_branch_unlikely(&dnuma_view_key))
++		return __dnuma_view_pinned_cpu(pid);
++	return -1;
++}
+ 
+ unsigned int __dnuma_view_nr_cpus(void);
+ void __dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT]);
+@@ -88,6 +97,8 @@
+ 
+ #else /* !CONFIG_DNUMA_VIEW */
+ 
++static inline int dnuma_view_pinned_cpu(struct pid *pid) { return -1; }
++
+ static inline unsigned int dnuma_view_nr_cpus(void) { return 0; }
+ static inline void dnuma_view_stat_sum(u64 sum[DNUMA_VIEW_NSTAT]) { }
+ static inline void dnuma_view_stat_show(struct seq_file *p) { }
+diff --git a/kernel/sched/syscalls.c b/kernel/sched/syscalls.c
+--- a/kernel/sched/syscalls.c
++++ b/kernel/sched/syscalls.c
+@@ -9,6 +9,7 @@
+  */
+ #include <linux/sched.h>
+ #include <linux/cpuset.h>
++#include <linux/dnuma_view.h>
+ #include <linux/sched/debug.h>
+ 
+ #include <uapi/linux/sched/types.h>
+@@ -1275,7 +1276,7 @@
+ 	return retval;
+ }
+ 
+-long sched_getaffinity(pid_t pid, struct cpumask *mask)
++static long get_task_affinity(pid_t pid, struct cpumask *mask, int *remote_cpu)
+ {
+ 	struct task_struct *p;
+ 	int retval;
+@@ -1289,10 +1290,18 @@
+ 	if (retval)
+ 		return retval;
+ 
++	if (remote_cpu)
++		*remote_cpu = dnuma_view_pinned_cpu(task_pid(p));
++
+ 	guard(raw_spinlock_irqsave)(&p->pi_lock);
+ 	cpumask_and(mask, &p->cpus_mask, cpu_active_mask);
+ 
+ 	return 0;
++}
++
++long sched_getaffinity(pid_t pid, struct cpumask *mask)
++{
++	return get_task_affinity(pid, mask, NULL);
+ }
+ 
+ /**
+@@ -1307,7 +1316,7 @@
+ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
+ 		unsigned long __user *, user_mask_ptr)
+ {
+-	int ret;
++	int ret, remote_cpu = -1;
+ 	cpumask_var_t mask;
+ 
+ 	if ((len * BITS_PER_BYTE) < nr_cpu_ids)
+@@ -1318,8 +1327,19 @@
+ 	if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+-	ret = sched_getaffinity(pid, mask);
+-	if (ret == 0) {
++	ret = get_task_affinity(pid, mask, &remote_cpu);
++	if (!ret && remote_cpu >= 0) {
++		unsigned int words = BIT_WORD(remote_cpu) + 1;
++		unsigned int bytes = words * sizeof(unsigned long);
++
++		if (len < bytes)
++			ret = -EINVAL;
++		else if (clear_user(user_mask_ptr, bytes) ||
++			 put_user(BIT_MASK(remote_cpu), user_mask_ptr + words - 1))
++			ret = -EFAULT;
++		else
++			ret = bytes;
++	} else if (!ret) {
+ 		unsigned int retlen = min(len, cpumask_size());
+ 
+ 		if (copy_to_user(user_mask_ptr, cpumask_bits(mask), retlen))

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "node/node_core.h"
+#include "node/native_pager.h"
 
 #include <cinttypes>
 #include <csignal>
@@ -7,6 +8,7 @@
 
 #include <fcntl.h>
 #include <linux/userfaultfd.h>
+#include <limits>
 #include <spawn.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -354,20 +356,35 @@ void NodeCore::on_rt_ready(Proc& p, Msg&& m) {
     Status st = reactor_.add_fd(img.uffd.get(), EPOLLIN, [this, proc](uint32_t) { on_uffd(proc); });
     if (!st.is_ok()) return fail_image_create(p.id, st.str());
     img.ready = true;
-    // Can this kernel unmap pages of another process on our behalf? Stock
-    // kernels refuse MADV_DONTNEED through process_madvise(); probe on the
-    // reserved tail of the range, which never holds data.
-    img.remote_zap = remote_zap(img, p.va_base + p.va_size - kPageSize, kPageSize);
+    // The final page is reserved for testing page removal and holds no data.
+    if (img.backing.valid()) {
+        img.revocation = Image::Revocation::Shmem;
+    } else {
+        auto tail = p.va_base + p.va_size - kPageSize;
+        img.revocation = Image::Revocation::Userfaultfd;
+        if (!remote_zap(img, tail, kPageSize)) {
+            img.revocation = Image::Revocation::ProcessMadvise;
+            if (!remote_zap(img, tail, kPageSize)) img.revocation = Image::Revocation::Cooperative;
+        }
+    }
+    const bool direct = img.revocation != Image::Revocation::Cooperative;
 
     ImageMsg rep;
     rep.proc = p.id;
     rep.pid = img.pid;
     rep.uffd_features = img.uffd_features;
-    rep.flags = uint8_t((img.kernel_faults ? kImageKernelFaults : 0) | (img.remote_zap ? kImageRemoteZap : 0));
+    rep.flags = uint8_t((img.kernel_faults ? kImageKernelFaults : 0) | (direct ? kImageRemoteZap : 0));
     rep.text = cfg_.hostname;
     hooks_.to_coordinator(make_msg(MsgType::ImageReady, rep, img.create_req, inc_));
-    LOG_INFO("proc %" PRIu64 ": image pid %d ready (kernel-mode faults: %s, revocation: %s)", p.id, img.pid,
-             img.kernel_faults ? "yes" : "NO", img.remote_zap ? "process_madvise (performed by the pager)" : "cooperative unmap + pagemap verification");
+    const char* method = "cooperative unmap";
+    switch (img.revocation) {
+    case Image::Revocation::Cooperative: break;
+    case Image::Revocation::Shmem: method = "shmem hole punch"; break;
+    case Image::Revocation::Userfaultfd: method = "userfaultfd eviction"; break;
+    case Image::Revocation::ProcessMadvise: method = "process_madvise"; break;
+    }
+    LOG_INFO("proc %" PRIu64 ": image pid %d ready (kernel-mode faults: %s, revocation: %s)",
+             p.id, img.pid, img.kernel_faults ? "yes" : "NO", method);
     // Faults may already be queued on the descriptor.
     on_uffd(proc);
 }
@@ -494,7 +511,24 @@ void NodeCore::on_image_msg(Image* img, ProcId proc, Msg&& m) {
             w.uid = p->uid;
             w.gid = p->gid;
         }
-        img->chan->send(make_msg(MsgType::RtWelcome, w));
+        Msg welcome = make_msg(MsgType::RtWelcome, w);
+        constexpr uint64_t needed = UFFD_FEATURE_MISSING_SHMEM | UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
+        if (w.status == 0 && m.req_id == kRtShmemBacking && (res_.uffd_features & needed) == needed &&
+            w.va_size >= kPageSize && w.va_size <= uint64_t(std::numeric_limits<off_t>::max())) {
+            Fd fd(memfd_create("dnuma-shadow", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+            if (fd.valid() && ftruncate(fd.get(), off_t(w.va_size)) == 0 &&
+                fcntl(fd.get(), F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == 0 &&
+                fallocate(fd.get(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off_t(w.va_size - kPageSize), kPageSize) == 0) {
+                int copy = fcntl(fd.get(), F_DUPFD_CLOEXEC, 0);
+                if (copy >= 0) {
+                    welcome.fds.push_back(copy);
+                    welcome.req_id = kRtShmemBacking;
+                    img->backing = std::move(fd);
+                    img->backing_base = w.va_base;
+                }
+            }
+        }
+        img->chan->send(std::move(welcome));
         break;
     }
     case MsgType::RtReady:
@@ -667,7 +701,7 @@ void NodeCore::segv(Image& img, int tid, uint64_t addr) {
     uffd_wake(img, addr & ~(kPageSize - 1));
 }
 
-void NodeCore::request_page(Proc& p, PageNo page, LocalPage& lp, Access need) {
+void NodeCore::request_page(Proc& p, PageNo page, LocalPage& lp, Access need, int tid) {
     if (at_least(lp.requested, need)) return;
     lp.requested = need;
     if (!lp.fault_t0) lp.fault_t0 = now_ns();
@@ -676,7 +710,10 @@ void NodeCore::request_page(Proc& p, PageNo page, LocalPage& lp, Access need) {
     rq.page = page;
     rq.access = need;
     metrics_.add("page_requests");
-    hooks_.to_coordinator(make_msg(MsgType::PageRequest, rq, 0, inc_));
+    // PAGE_REQUEST uses its optional request id to identify the faulting context.
+    auto ctx = p.image->tid_ctx.find(tid);
+    CtxId id = ctx == p.image->tid_ctx.end() ? 0 : ctx->second;
+    hooks_.to_coordinator(make_msg(MsgType::PageRequest, rq, id, inc_));
 }
 
 void NodeCore::on_fault(Proc& p, uint64_t addr, uint64_t flags, int tid) {
@@ -694,7 +731,7 @@ void NodeCore::on_fault(Proc& p, uint64_t addr, uint64_t flags, int tid) {
     if (lp.zapping) {
         // Being revoked right now: the thread stays blocked until the unmap
         // is verified; ask the master to bring the page back afterwards.
-        return request_page(p, page, lp, need);
+        return request_page(p, page, lp, need, tid);
     }
     if (lp.where == Where::Mapped) {
         if (need == Access::Read || lp.mapped_rw) {
@@ -703,17 +740,25 @@ void NodeCore::on_fault(Proc& p, uint64_t addr, uint64_t flags, int tid) {
         }
         if (lp.right == Access::Write) {
             // We own the page; only the local mapping is read-only.
-            if (uffd_wp(img, addr_of(page), false).is_ok()) lp.mapped_rw = true;
+            Status st = uffd_wp(img, addr_of(page), false);
+            if (!st.is_ok()) {
+                LOG_ERROR("proc %" PRIu64 ": %s", p.id, st.str().c_str());
+                return kill_image(img);
+            }
+            lp.mapped_rw = true;
             return;
         }
-        return request_page(p, page, lp, need);
+        return request_page(p, page, lp, need, tid);
     }
     if (lp.where == Where::Parked && at_least(lp.right, need)) {
         Status st = install_from_parked(p, page, lp);
-        if (!st.is_ok()) LOG_ERROR("proc %" PRIu64 ": %s", p.id, st.str().c_str());
+        if (!st.is_ok()) {
+            LOG_ERROR("proc %" PRIu64 ": %s", p.id, st.str().c_str());
+            kill_image(img);
+        }
         return;
     }
-    request_page(p, page, lp, need);
+    request_page(p, page, lp, need, tid);
 }
 
 Status NodeCore::install(Proc& p, PageNo page, LocalPage& lp, const uint8_t* src, bool rw, int phys) {
@@ -728,12 +773,11 @@ Status NodeCore::install(Proc& p, PageNo page, LocalPage& lp, const uint8_t* src
     cp.mode = rw ? 0 : UFFDIO_COPY_MODE_WP;
     for (;;) {
         if (ioctl(img.uffd.get(), UFFDIO_COPY, &cp) == 0) break;
-        if (errno == EAGAIN) continue; // mm changed underneath; retry
+        if (errno == EAGAIN || errno == EINTR) continue;
+        // EEXIST means the bytes at this address have unknown provenance.
         if (errno == EEXIST) {
-            // A mapping is already there. That contradicts our bookkeeping.
-            LOG_ERROR("proc %" PRIu64 ": page 0x%" PRIx64 " unexpectedly present at install", p.id, addr_of(page));
-            uffd_wake(img, addr_of(page));
-            break;
+            kill_image(img);
+            return Status::err(EEXIST, "unexpected mapping at 0x%" PRIx64, addr_of(page));
         }
         return Status::sys("UFFDIO_COPY page 0x%" PRIx64, addr_of(page));
     }
@@ -769,7 +813,7 @@ Status NodeCore::uffd_wp(Image& img, uint64_t addr, bool protect) {
     wp.mode = protect ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
     for (;;) {
         if (ioctl(img.uffd.get(), UFFDIO_WRITEPROTECT, &wp) == 0) return Status::ok();
-        if (errno == EAGAIN) continue;
+        if (errno == EAGAIN || errno == EINTR) continue;
         return Status::sys("UFFDIO_WRITEPROTECT 0x%" PRIx64, addr);
     }
 }
@@ -789,6 +833,20 @@ bool NodeCore::page_present(Image& img, uint64_t addr, bool* known) {
 }
 
 bool NodeCore::remote_zap(Image& img, uint64_t addr, uint64_t len) {
+    if (img.revocation == Image::Revocation::Shmem) {
+        if (addr < img.backing_base) { errno = EINVAL; return false; }
+        if (fallocate(img.backing.get(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                      off_t(addr - img.backing_base), off_t(len)) != 0) return false;
+        // A file PTE can retain an uffd-wp marker over the punched hole.
+        // Removing the marker makes subsequent writers take a missing fault
+        // and allows pagemap verification to distinguish it from swap.
+        uffdio_writeprotect clear{{addr, len}, 0};
+        return ioctl(img.uffd.get(), UFFDIO_WRITEPROTECT, &clear) == 0;
+    }
+    if (img.revocation == Image::Revocation::Userfaultfd) {
+        uffdio_range range{addr, len};
+        return ioctl(img.uffd.get(), DNUMA_UFFD_EVICT, &range) == 0;
+    }
     iovec iov{reinterpret_cast<void*>(addr), len};
     return syscall(SYS_process_madvise, img.pidfd.get(), &iov, 1, MADV_DONTNEED, 0) == ssize_t(len);
 }
@@ -885,15 +943,24 @@ void NodeCore::on_grant(const PageMsg& g) {
             LOG_ERROR("proc %" PRIu64 ": local grant for page 0x%" PRIx64 " we do not hold", g.proc, addr_of(g.page));
             return send_complete(g, ENOENT);
         }
+        const Access previous = lp.right;
         lp.right = g.access;
         if (lp.where == Where::Mapped && g.access == Access::Write && !lp.mapped_rw &&
             lp.requested == Access::Write) {
-            if (uffd_wp(*p.image, addr_of(g.page), false).is_ok()) lp.mapped_rw = true;
+            Status st = uffd_wp(*p.image, addr_of(g.page), false);
+            if (!st.is_ok()) {
+                lp.right = previous;
+                return send_complete(g, st.code());
+            }
+            lp.mapped_rw = true;
         } else if (lp.where == Where::Mapped) {
             uffd_wake(*p.image, addr_of(g.page));
         } else if (lp.where == Where::Parked && have_image && lp.requested != Access::None) {
             Status st = install_from_parked(p, g.page, lp);
-            if (!st.is_ok()) LOG_ERROR("proc %" PRIu64 ": %s", g.proc, st.str().c_str());
+            if (!st.is_ok()) {
+                lp.right = previous;
+                return send_complete(g, st.code());
+            }
         }
         settle(p, g.page, lp, g.access);
         return send_complete(g, 0);
@@ -1097,9 +1164,16 @@ void NodeCore::on_revoke(const PageMsg& r) {
         finish_revoke(proc, page, gen, mode, want_export ? int32_t(slot) : -1, t0, Status::ok());
         if (!want_export) maybe_erase(*p, page);
     };
-    if (img.remote_zap && remote_zap(img, addr, kPageSize)) {
-        metrics_.add("revoke_remote_zap");
-        return verify(Status::ok());
+    if (img.revocation != Image::Revocation::Cooperative) {
+        if (remote_zap(img, addr, kPageSize)) {
+            metrics_.add("revoke_remote_zap");
+            if (img.revocation == Image::Revocation::Shmem) metrics_.add("revoke_shmem");
+            return verify(Status::ok());
+        }
+        // MADV_DONTNEED in the application would leave the shmem cache
+        // populated, allowing stale bytes to be faulted straight back in.
+        if (img.revocation == Image::Revocation::Shmem)
+            return verify(Status::sys("punching shadow page 0x%" PRIx64, addr));
     }
     metrics_.add("revoke_coop");
     zap(img, addr, kPageSize, verify);

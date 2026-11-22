@@ -80,6 +80,26 @@ static uint64_t slot_worker(void* p) {
     return 0;
 }
 
+struct LocalityTest {
+    uint32_t turn;
+    uint32_t rounds;
+};
+
+static uint64_t converse(void* arg, uint32_t mine) {
+    auto* shared = static_cast<LocalityTest*>(arg);
+    uint32_t rounds = shared->rounds;
+    for (uint32_t i = 0; i < rounds; ++i) {
+        while (__atomic_load_n(&shared->turn, __ATOMIC_ACQUIRE) != mine)
+            dnuma_migration_point();
+        __atomic_store_n(&shared->turn, 1 - mine, __ATOMIC_RELEASE);
+        dnuma_migration_point();
+    }
+    return rounds;
+}
+
+static uint64_t producer(void* arg) { return converse(arg, 0); }
+static uint64_t consumer(void* arg) { return converse(arg, 1); }
+
 static uint64_t mutex_worker(void* p) {
     Shared* s = static_cast<Arg*>(p)->s;
     for (uint64_t i = 0; i < s->incs; ++i) {
@@ -156,6 +176,20 @@ int main(int argc, char** argv) {
     run_all(s, args, four, 4, mutex_worker, "mutex");
     CHECK(*s->plain == 4 * s->incs, "mutex-protected counter %" PRIu64 ", expected %" PRIu64, *s->plain, 4 * s->incs);
     printf("D distributed mutex: %" PRIu64 " (expected %" PRIu64 ")\n", *s->plain, 4 * s->incs);
+
+    // One partner requests the slave. The freely placed worker starts on a
+    // master node, then follows its partner after repeated page handoffs.
+    auto* handoff = static_cast<LocalityTest*>(dnuma_alloc(sizeof(LocalityTest), r, 0));
+    REQUIRE(handoff, "alloc locality page");
+    handoff->rounds = 1000;
+    dnuma_thread_t pinned, movable;
+    REQUIRE(dnuma_thread_create(&pinned, r, consumer, handoff) == 0, "create consumer");
+    REQUIRE(dnuma_thread_create(&movable, DNUMA_NODE_ANY, producer, handoff) == 0, "create producer");
+    dnuma_thread_info fixed{}, moved{};
+    REQUIRE(dnuma_thread_join(pinned, nullptr, &fixed) == 0, "join consumer");
+    REQUIRE(dnuma_thread_join(movable, nullptr, &moved) == 0, "join producer");
+    CHECK(fixed.logical_node == r && fixed.migrations == 0, "explicit placement changed");
+    CHECK(moved.logical_node == r && moved.migrations > 0, "locality migration missing");
 
     dnuma_page_info pi;
     if (dnuma_query_page(s->atomic_counter, &pi) == 0)

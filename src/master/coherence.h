@@ -39,6 +39,8 @@ struct PageEntry {
     bool busy = false;
     MachineId owner = kNoMachine;   // machine holding the authoritative copy
     Generation gen = 0;
+    CtxId last_ctx = 0;             // last fault for which the directory granted access
+    MachineId last_machine = kNoMachine;
     std::vector<MachineId> readers; // machines holding read-only replicas (excludes owner)
 };
 
@@ -46,7 +48,9 @@ struct Region {
     PageNo first = 0;
     uint64_t count = 0;
     NodeId home = kNoNode; // placement target (logical NUMA domain)
-    std::vector<PageEntry> pages;
+    PageEntry initial; // untouched native bytes belong to the live home mm
+    std::map<PageNo, PageEntry> pages; // only pages involved in directory operations
+    bool releasing = false;
 };
 
 struct MachineUsage {
@@ -58,6 +62,7 @@ struct MachineUsage {
 class CoherenceIo {
 public:
     virtual ~CoherenceIo() = default;
+    virtual void page_handoff(ProcId proc, CtxId writer, MachineId from, CtxId peer, MachineId to, uint64_t cost_ns) {}
     virtual void send_page(MachineId to, MsgType type, const PageMsg& m) = 0;
     virtual Incarnation incarnation_of(MachineId m) = 0;
     // False once a machine is fenced/failed: nothing new may be sent to it.
@@ -78,6 +83,9 @@ public:
     void destroy_space(ProcId proc);
     bool has_space(ProcId proc) const { return spaces_.count(proc) != 0; }
     Status allocate(ProcId proc, uint64_t npages, NodeId home, PageNo* first);
+    // Enroll an existing mapping at its Linux virtual address. First remote
+    // access must fetch its contents from the master, including nonzero data.
+    Status register_native_region(ProcId proc, PageNo first, uint64_t count, NodeId home);
     // Invalidates every copy of every page in the region, then removes it.
     void free_region(ProcId proc, PageNo first, Done done);
     // Records pages that a machine materialized as parked zero pages.
@@ -85,7 +93,7 @@ public:
     void set_region_home(ProcId proc, PageNo region_first, NodeId home);
 
     // ---- protocol events ----
-    void on_request(MachineId from, const PageMsg& m);
+    void on_request(MachineId from, const PageMsg& m, CtxId ctx = 0);
     void on_revoked(MachineId from, const PageMsg& m);
     void on_complete(MachineId from, const PageMsg& m);
 
@@ -129,6 +137,7 @@ private:
 
     struct Txn {
         Kind kind{};
+        CtxId ctx = 0;
         Phase phase{};
         Generation gen = 0;
         MachineId target = kNoMachine; // requester (fault) / destination (migrate) / holder (drop)
@@ -167,7 +176,7 @@ private:
     void account(Space& sp, const PageEntry& e, int sign);
 
     Txn& begin(ProcId proc, PageNo page, PageEntry& e, Kind kind, MachineId target);
-    void start_fault(MachineId from, ProcId proc, PageNo page, Access access);
+    void start_fault(MachineId from, ProcId proc, PageNo page, Access access, CtxId ctx);
     void start_migrate(ProcId proc, PageNo page, MachineId dest, Done done);
     void start_drop(ProcId proc, PageNo page, MachineId holder, Done done);
     void start_discard(ProcId proc, PageNo page, Done done);

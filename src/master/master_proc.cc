@@ -8,6 +8,7 @@
 // image* per slave, created on demand to host execution contexts there.
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 
 #include <unistd.h>
 
@@ -282,6 +283,7 @@ void Master::do_thread_create(Process& p, const AppCallMsg& call) {
     CtxId cid = next_ctx_++;
     ExecCtx& c = p.ctxs[cid];
     c.id = cid;
+    c.auto_place = rq.logical_node == -1;
     c.proc = p.id;
     c.machine = rec->machine;
     c.node = rec->id;
@@ -320,6 +322,53 @@ void Master::start_ctx(Process& p, ExecCtx& c) {
     e.node = c.node;
     send_to_machine(c.machine, make_msg(MsgType::ExecCreate, e));
     send_to_machine(c.machine, make_msg(MsgType::ExecStart, e));
+}
+
+void Master::page_handoff(ProcId proc, CtxId ctx, MachineId from, CtxId peer, MachineId to, uint64_t cost) {
+    Process* p = find_proc(proc);
+    if (!p) return;
+    auto a = p->ctxs.find(ctx), b = p->ctxs.find(peer);
+    if (a == p->ctxs.end() || b == p->ctxs.end()) return;
+    ExecCtx* mover = &a->second;
+    ExecCtx* partner = &b->second;
+    if (mover->machine != from || partner->machine != to ||
+        mover->state != ExecCtx::State::Running || partner->state != ExecCtx::State::Running) return;
+    if (!mover->auto_place) std::swap(mover, partner);
+    if (!mover->auto_place) return;
+
+    // Require repeated handoffs. Discount older observations by half each
+    // second so a previous sharing phase cannot pay for a migration today.
+    uint64_t now = now_ns();
+    if (mover->peer != partner->id || !mover->peer_sample_ns) {
+        mover->peer = partner->id;
+        mover->peer_sample_ns = now;
+        mover->handoff_ns = double(cost);
+        return;
+    }
+    mover->handoff_ns *= std::exp2(-double(now - mover->peer_sample_ns) / 1e9);
+    mover->peer_sample_ns = now;
+    mover->handoff_ns += double(cost);
+    const Histogram* latency = metrics_.hist("thread_migration_ns");
+    // Bootstrap from the measured lab migration latency until this master
+    // has completed a migration of its own.
+    uint64_t move_cost = latency && latency->count() ? latency->quantile(0.5) : 5 * kMs;
+    if (mover->handoff_ns < double(move_cost) || now - mover->t_migrate < move_cost) return;
+    const NodeRecord* dest = topo_.by_id(partner->node);
+    if (!dest || !dest->present) return;
+    if (dest->machine != kMasterMachine) {
+        Slave* slave = slave_by_machine(dest->machine);
+        if (!slave || !lifecycle_placeable(slave->state)) return;
+    }
+    size_t load = 0;
+    for (const auto& [id, process] : procs_)
+        for (const auto& [cid, c] : process.ctxs)
+            if (c.state != ExecCtx::State::Exited &&
+                (c.node == dest->id || (c.state == ExecCtx::State::Suspending && c.migrate_node == dest->id))) ++load;
+    if (load >= dest->cpus.size()) return;
+    if (request_ctx_migration(*p, *mover, dest->id).is_ok()) {
+        metrics_.add("locality_migration_requests");
+        mover->peer_sample_ns = partner->peer_sample_ns = 0;
+    }
 }
 
 Status Master::request_ctx_migration(Process& p, ExecCtx& c, NodeId dest) {
@@ -572,6 +621,7 @@ void Master::on_app_call(MachineId from, const Msg& m) {
         Status st = resolve_node(rq.logical_node, true, &rec);
         if (st.is_ok() && !rec) st = Status::err(EINVAL, "a destination NUMA node is required");
         if (st.is_ok()) st = request_ctx_migration(*p, it->second, rec->id);
+        if (st.is_ok()) it->second.auto_place = false;
         return app_reply(call, st.code(), st.message(), {});
     }
     case AppOp::Topology: {

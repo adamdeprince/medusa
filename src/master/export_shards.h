@@ -33,7 +33,7 @@ public:
     ExportShards(Reactor& main, Hooks hooks, unsigned threads);
     ~ExportShards();
 
-    Status start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu);
+    Status start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu, ExportPlacement placement);
     Status recall(pid_t pid, const std::string& why, bool pin);
     void recall_all(MachineId machine, const std::string& why);
     void machine_lost(MachineId machine, const std::string& why, std::vector<std::string>* killed);

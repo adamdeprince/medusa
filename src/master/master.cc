@@ -248,7 +248,7 @@ void Master::on_node_msg(MachineId from, Msg&& m) {
     case MsgType::PageTransferComplete: {
         PageMsg pm;
         if (!parse_msg(m, &pm)) break;
-        if (m.type == MsgType::PageRequest) coh_.on_request(from, pm);
+        if (m.type == MsgType::PageRequest) coh_.on_request(from, pm, m.req_id);
         else if (m.type == MsgType::PageRevoked) coh_.on_revoked(from, pm);
         else coh_.on_complete(from, pm);
         break;

@@ -19,7 +19,16 @@ endif()
 
 # ---- ordinary native programs (no dnuma library) used by the process-export tests ----
 enable_language(C)
-foreach(t n_spin)
+foreach(t n_spin n_readmostly)
   add_executable(${t} integration/progs/${t}.c)
   set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests COMPILE_OPTIONS "-O2")
 endforeach()
+
+# Run inside a disposable kernel with CONFIG_DNUMA_NATIVE_PAGER.
+add_executable(n_native_pager integration/progs/n_native_pager.cc)
+target_link_libraries(n_native_pager PRIVATE dnuma_coord Threads::Threads)
+
+add_executable(n_thread_pair integration/progs/n_thread_pair.c)
+target_link_libraries(n_thread_pair PRIVATE Threads::Threads)
+add_test(NAME native_thread_pair_local COMMAND n_thread_pair)
+set_tests_properties(native_thread_pair_local PROPERTIES SKIP_RETURN_CODE 77)

@@ -156,7 +156,9 @@ const SysDesc kIoctlInt{SYS_ioctl, "ioctl(int*)", F, {V, V, SOut(4)}};
 const SysDesc kIoctlNoArg{SYS_ioctl, "ioctl(noarg)", F, {V, V, V}};
 const SysDesc kFcntlVal{SYS_fcntl, "fcntl", F, {V, V, V}};
 const SysDesc kFcntlLock{SYS_fcntl, "fcntl(lock)", F, {V, V, SIO(kFlock)}};
-const SysDesc kFutexWake{SYS_futex, "futex(wake)", L, {V, V, V}};
+// The home kernel derives a private futex key from the address and mm.
+// WAKE and WAKE_BITSET do not read the word. Preserve the original address.
+const SysDesc kFutexWake{SYS_futex, "futex(wake)", F, {V, V, V, V, V, V}};
 const SysDesc kPrctlSetName{SYS_prctl, "prctl(PR_SET_NAME)", F, {V, SIn(16)}};
 const SysDesc kPrctlGetName{SYS_prctl, "prctl(PR_GET_NAME)", F, {V, SOut(16)}};
 const SysDesc kMadviseHint{SYS_madvise, "madvise(hint)", L, {V, V, V}};
@@ -200,9 +202,7 @@ const SysDesc& describe_syscall(int64_t nr, const uint64_t args[6]) {
         default: return kHome;
         }
     case SYS_futex:
-        // A process with one thread has no private waiters to wake. Anything
-        // else (waiting, shared futexes) needs the real kernel queues.
-        if ((args[1] & 0x7f) == FUTEX_WAKE && (args[1] & FUTEX_PRIVATE_FLAG)) return kFutexWake;
+        if (args[1] == FUTEX_WAKE_PRIVATE || args[1] == FUTEX_WAKE_BITSET_PRIVATE) return kFutexWake;
         return kHome;
     case SYS_prctl:
         if (args[0] == 15) return kPrctlSetName;

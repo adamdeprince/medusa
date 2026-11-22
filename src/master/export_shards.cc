@@ -35,10 +35,16 @@ ExportShards::ExportShards(Reactor& main, Hooks hooks, unsigned threads) : main_
         auto it = names_.find(m);
         return it == names_.end() ? "machine " + std::to_string(m) : it->second;
     };
-    h.on_end = [this, alive](MachineId m, pid_t pid) {
-        main_.post([this, alive, m, pid] {
+    h.on_ready = [this, alive](uint64_t xid, pid_t pid, int cpu, bool pinned) {
+        main_.post([this, alive, xid, pid, cpu, pinned] {
             auto a = alive.lock();
-            if (a && *a && hooks_.on_end) hooks_.on_end(m, pid);
+            if (a && *a && hooks_.on_ready) hooks_.on_ready(xid, pid, cpu, pinned);
+        });
+    };
+    h.on_end = [this, alive](uint64_t xid, MachineId m, pid_t pid) {
+        main_.post([this, alive, xid, m, pid] {
+            auto a = alive.lock();
+            if (a && *a && hooks_.on_end) hooks_.on_end(xid, m, pid);
         });
     };
 
@@ -70,7 +76,7 @@ ExportShards::~ExportShards() {
     }
 }
 
-Status ExportShards::start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu) {
+Status ExportShards::start(pid_t pid, MachineId machine, int cpu, int node, int local_cpu, ExportPlacement placement) {
     if (is_exported(pid)) return Status::err(EALREADY, "already exported");
     {
         std::string name = hooks_.machine_name(machine);
@@ -79,7 +85,7 @@ Status ExportShards::start(pid_t pid, MachineId machine, int cpu, int node, int 
     }
     Shard& s = *shards_[next_++ % shards_.size()];
     Status st = Status::ok();
-    on_shard(s, [&] { st = s.mgr->start(pid, machine, cpu, node, local_cpu); });
+    on_shard(s, [&] { st = s.mgr->start(pid, machine, cpu, node, local_cpu, placement); });
     return st;
 }
 

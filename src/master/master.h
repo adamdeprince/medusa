@@ -138,6 +138,10 @@ struct ExecCtx {
     uint64_t stack_pages = 0;
     enum class State { Creating, Running, Suspending, Moving, Exited } state = State::Creating;
     ThreadInfo info;
+    bool auto_place = false;
+    CtxId peer = 0;
+    uint64_t peer_sample_ns = 0;
+    double handoff_ns = 0;
     NodeId migrate_node = kNoNode;
     uint64_t saved_sp = 0;
     uint64_t t_migrate = 0;
@@ -176,6 +180,7 @@ public:
     void send_page(MachineId to, MsgType type, const PageMsg& m) override;
     Incarnation incarnation_of(MachineId m) override;
     bool machine_usable(MachineId m) override;
+    void page_handoff(ProcId proc, CtxId ctx, MachineId from, CtxId peer, MachineId to, uint64_t cost) override;
     void coherence_failure(ProcId proc, const std::string& why) override;
 
 private:
@@ -246,9 +251,9 @@ private:
     void export_init();
     void export_tick();
     void export_slave_attached(Slave& s);
-    Slave* export_target(const std::string& name, std::string* why);
+    Slave* export_target(const std::string& name, std::string* why, bool require_idle = true);
     int export_pick_cpu(Slave& s);
-    Status export_pid(pid_t pid, Slave& s);
+    Status export_pid(pid_t pid, Slave& s, ExportPlacement placement, int cluster_cpu = -1);
     std::string render_exports();
 
     // ---- the kernel's /proc view of slave CPUs and exported work (master_view.cc) ----
@@ -256,8 +261,8 @@ private:
     void view_slave_attached(Slave& s);
     void view_slave_gone(Slave& s);
     void on_view_sample(Slave& s, const ViewSampleMsg& m);
-    void view_task_started(pid_t pid, int cpu);
-    void view_task_ended(pid_t pid);
+    void view_task_started(uint64_t xid, pid_t pid, int cpu, bool pinned);
+    void view_task_ended(uint64_t xid, pid_t pid);
     void view_task_exited(pid_t pid);
     std::string render_view();
 

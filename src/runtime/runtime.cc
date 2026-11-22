@@ -495,10 +495,10 @@ int make_uffd(int dev_fd, bool* kernel_faults) {
     return fd;
 }
 
-Status setup_memory(int dev_fd, RtReadyMsg* ready, int* uffd_out) {
+Status setup_memory(int dev_fd, int backing_fd, RtReadyMsg* ready, int* uffd_out) {
     void* want = reinterpret_cast<void*>(g->va_base);
-    void* p = mmap(want, g->va_size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    int flags = backing_fd >= 0 ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS;
+    void* p = mmap(want, g->va_size, PROT_READ | PROT_WRITE, flags | MAP_NORESERVE | MAP_FIXED_NOREPLACE, backing_fd, 0);
     if (p == MAP_FAILED) return Status::sys("reserving distributed range at 0x%llx", (unsigned long long)g->va_base);
     if (p != want) return Status::err(EEXIST, "distributed range 0x%llx is already in use in this process", (unsigned long long)g->va_base);
     // 4 KiB is the coherence unit; huge pages would entangle neighbours.
@@ -527,6 +527,7 @@ Status setup_memory(int dev_fd, RtReadyMsg* ready, int* uffd_out) {
     uffdio_api real{};
     real.api = UFFD_API;
     real.features = supported & (UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_THREAD_ID);
+    if (backing_fd >= 0) real.features |= UFFD_FEATURE_MISSING_SHMEM | UFFD_FEATURE_WP_HUGETLBFS_SHMEM;
     if (ioctl(fd, UFFDIO_API, &real) != 0) {
         Status st = Status::sys("UFFDIO_API");
         close(fd);
@@ -553,7 +554,7 @@ void handshake(ImageRole role, int argc, char** argv) {
     hello.pid = getpid();
     for (int i = 0; i < argc; ++i) hello.argv.emplace_back(argv[i]);
     hello.canary = read_canary();
-    Status st = send_msg_blocking(g->sock, make_msg(MsgType::RtHello, hello));
+    Status st = send_msg_blocking(g->sock, make_msg(MsgType::RtHello, hello, role == ImageRole::Shadow ? kRtShmemBacking : 0));
     Msg m;
     if (st.is_ok()) st = recv_msg_blocking(g->sock, &m);
     RtWelcomeMsg w;
@@ -561,7 +562,12 @@ void handshake(ImageRole role, int argc, char** argv) {
         dprintf(2, "dnuma: cannot register with the node daemon: %s\n", st.is_ok() ? "bad reply" : st.str().c_str());
         _exit(125);
     }
-    int dev_fd = m.fds.empty() ? -1 : m.fds[0];
+    bool shmem = role == ImageRole::Shadow && m.req_id == kRtShmemBacking;
+    if (m.fds.size() > 1 || (shmem && m.fds.size() != 1)) {
+        dprintf(2, "dnuma: invalid descriptor count in runtime welcome\n");
+        _exit(125);
+    }
+    int received = m.fds.empty() ? -1 : m.fds[0];
     if (w.status != 0) {
         dprintf(2, "dnuma: registration refused: %s\n", w.text.c_str());
         _exit(125);
@@ -574,8 +580,8 @@ void handshake(ImageRole role, int argc, char** argv) {
 
     RtReadyMsg ready;
     int uffd = -1;
-    st = setup_memory(dev_fd, &ready, &uffd);
-    if (dev_fd >= 0) close(dev_fd);
+    st = setup_memory(shmem ? -1 : received, shmem ? received : -1, &ready, &uffd);
+    if (received >= 0) close(received);
 
     if (role == ImageRole::Shadow) {
         // Same stack-protector canary as the home image, so that frames

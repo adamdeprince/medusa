@@ -18,7 +18,10 @@ total=$((NCPU + excess))
 tmp=$(mktemp -d /tmp/dnuma-export.XXXXXX)
 say "$total processes for ${secs}s on a $NCPU-CPU master; slave $SLAVE has $SCPU CPUs"
 
-( seq "$total" | xargs -P "$total" -I{} sh -c "exec $T/n_spin $secs 8 $tmp 25 > $tmp/{}.out 2>&1" ) & xp=$!
+# One CPU-bound worker has an explicit local affinity mask.
+local_cpu=$(awk '/^Cpus_allowed_list:/ {split($2,c,/[-,]/); print c[1]}' /proc/self/status)
+taskset -c "$local_cpu" "$T/n_spin" "$secs" 8 "$tmp" 1 > "$tmp/pinned.out" 2>&1 & pinned=$!
+( seq "$((total - 1))" | xargs -P "$total" -I{} sh -c "exec $T/n_spin $secs 8 $tmp 25 > $tmp/{}.out 2>&1" ) & xp=$!
 peak=0
 for i in $(seq $((secs - 2))); do
   sleep 1
@@ -26,6 +29,10 @@ for i in $(seq $((secs - 2))); do
 done
 say "  exported at peak: $peak; slave load then: $(slave "cut -d' ' -f1 /proc/loadavg")"
 wait $xp; expect "xargs exit code" "$?" "0"
+
+wait "$pinned"; expect "pinned worker exit code" "$?" "0"
+pinned_cpus=$(awk '/^FINAL/ {print $5}' "$tmp/pinned.out")
+expect "pinned worker stayed on its chosen CPU" "$pinned_cpus" "$local_cpu..$local_cpu"
 
 expect "processes that reported PASS" "$(grep -l '^RESULT PASS' "$tmp"/*.out | wc -l | tr -d ' ')" "$total"
 remote=$(awk -v n="$NCPU" '/^FINAL/ {split($5, a, "."); if (a[3] >= n) c++} END {print c + 0}' "$tmp"/*.out)

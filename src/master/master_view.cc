@@ -105,12 +105,7 @@ void Master::on_view_sample(Slave& s, const ViewSampleMsg& m) {
             auto it = view_tasks_.find(p->second);
             if (it == view_tasks_.end()) continue;
             ViewTask& t = it->second;
-            if (t.xid != xid) {
-                t.base_utime += t.cur_utime;
-                t.base_stime += t.cur_stime;
-                t.cur_utime = t.cur_stime = 0;
-                t.xid = xid;
-            }
+            if (t.xid != xid) continue;
             const uint64_t before = t.cur_utime + t.cur_stime;
             t.cur_utime = std::max(t.cur_utime, local_ticks(m.bodies[i + 2]));
             t.cur_stime = std::max(t.cur_stime, local_ticks(m.bodies[i + 3]));
@@ -128,8 +123,10 @@ void Master::on_view_sample(Slave& s, const ViewSampleMsg& m) {
     view_.flush();
 }
 
-void Master::view_task_started(pid_t pid, int cpu) {
+void Master::view_task_started(uint64_t xid, pid_t pid, int cpu, bool pinned) {
     if (!view_.active()) return;
+    auto prev = view_tasks_.find(pid);
+    if (prev != view_tasks_.end() && prev->second.xid && prev->second.xid != xid) view_task_ended(prev->second.xid, pid);
     auto [it, fresh] = view_tasks_.try_emplace(pid);
     ViewTask& t = it->second;
     if (fresh) {
@@ -140,15 +137,18 @@ void Master::view_task_started(pid_t pid, int cpu) {
             if (!reactor_.add_fd(fd, EPOLLIN, [this, pid](uint32_t) { view_task_exited(pid); }).is_ok()) t.pidfd = Fd();
         }
     }
+    t.xid = xid;
     t.cpu = cpu;
     view_.set_task(pid, cpu, false, t.base_utime + t.cur_utime, t.base_stime + t.cur_stime);
+    if (pinned) view_.report_pin(pid, cpu);
     view_.flush();
 }
 
-void Master::view_task_ended(pid_t pid) {
+void Master::view_task_ended(uint64_t xid, pid_t pid) {
     auto it = view_tasks_.find(pid);
     if (it == view_tasks_.end()) return;
     ViewTask& t = it->second;
+    if (t.xid != xid) return;
     t.base_utime += t.cur_utime;
     t.base_stime += t.cur_stime;
     t.cur_utime = t.cur_stime = 0;

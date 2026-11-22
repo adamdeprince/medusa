@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstring>
 
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -105,12 +106,40 @@ TEST(live_kernel_interface) {
     CHECK(stat_field(s, 14) == std::to_string(own + 500));
     CHECK(stat_field(s, 15) == std::string("20"));
     CHECK(stat_field(s, 39) == std::to_string(base + 2));
+    // A CPU ID past the local bitmap (and CPU_SETSIZE) must remain usable.
+    int pinned = base + CPU_SETSIZE;
+    size_t words = size_t(pinned) / (8 * sizeof(unsigned long)) + 1;
+    std::vector<unsigned long> mask(words);
+    if (v.can_report_pin()) {
+        v.set_cpu(pinned, remote_cpuinfo_block(blocks[1].second, pinned, 10, "pinned"));
+        v.set_task(child, pinned, false, 500, 20);
+        v.report_pin(child, pinned);
+        v.flush();
+        CHECK_EQ(syscall(SYS_sched_getaffinity, child, (words - 1) * sizeof(mask[0]), mask.data()), -1);
+        CHECK_EQ(errno, EINVAL);
+        CHECK_EQ(syscall(SYS_sched_getaffinity, child, words * sizeof(mask[0]), mask.data()), long(words * sizeof(mask[0])));
+        CHECK_EQ(CPU_COUNT_S(words * sizeof(mask[0]), reinterpret_cast<cpu_set_t*>(mask.data())), 1);
+        CHECK(CPU_ISSET_S(pinned, words * sizeof(mask[0]), reinterpret_cast<cpu_set_t*>(mask.data())));
+    }
     v.set_task(child, -1, false, 700, 20);
     v.flush();
     s = slurp(path);
     CHECK(stat_field(s, 3) == std::string("S"));
     CHECK(stat_field(s, 14) == std::to_string(own + 700));
     CHECK(atoi(stat_field(s, 39).c_str()) < base);
+    if (v.can_report_pin()) {
+        size_t bytes = words * sizeof(mask[0]);
+        auto* cpus = reinterpret_cast<cpu_set_t*>(mask.data());
+        CHECK(sched_getaffinity(child, bytes, cpus) == 0);
+        CHECK(!CPU_ISSET_S(pinned, bytes, cpus));
+        v.set_task(child, pinned, false, 700, 20);
+        v.report_pin(child, pinned);
+        v.flush();
+        CHECK(sched_getaffinity(child, bytes, cpus) == 0 && CPU_ISSET_S(pinned, bytes, cpus));
+        v.del_cpu(pinned);
+        v.flush();
+        CHECK(sched_getaffinity(child, bytes, cpus) == 0 && !CPU_ISSET_S(pinned, bytes, cpus));
+    }
     kill(child, SIGKILL);
     waitpid(child, nullptr, 0);
     v.set_task(child, base, true, 1, 1); // gone: must not disturb the commands after it

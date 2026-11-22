@@ -326,6 +326,10 @@ struct PageInfoReply {
 
 enum class ImageRole : uint8_t { Home = 0, Shadow = 1 };
 
+// RT_HELLO/RT_WELCOME request ID for a shadow willing to map the agent's
+// private shmem backing file. A zero reply uses the original anonymous map.
+inline constexpr uint64_t kRtShmemBacking = 1;
+
 struct RtHelloMsg {
     ImageRole role{};
     int32_t pid = 0;

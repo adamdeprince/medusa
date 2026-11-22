@@ -94,12 +94,14 @@ private:
         ProcId proc = 0;
         ImageRole role{};
         int pid = 0;
-        Fd pidfd, uffd, pagemap;
+        Fd pidfd, uffd, pagemap, backing;
+        uint64_t backing_base = 0;
         std::unique_ptr<StreamChannel> chan;
         bool ready = false, dead = false;
         uint64_t uffd_features = 0;
         bool kernel_faults = false;
-        bool remote_zap = false; // kernel lets the pager unmap this image's pages itself
+        enum class Revocation { Cooperative, Userfaultfd, ProcessMadvise, Shmem };
+        Revocation revocation = Revocation::Cooperative;
         std::unordered_map<uint64_t, std::function<void(Status)>> zaps;
         std::unordered_map<int, CtxId> tid_ctx;
         std::unordered_map<CtxId, int> ctx_phys;
@@ -142,7 +144,7 @@ private:
     void on_release(const PageMsg& r);
     void on_abort(const PageMsg& r);
     void on_memory_allocate(const MemoryMsg& mm, uint64_t req);
-    void request_page(Proc& p, PageNo page, LocalPage& lp, Access need);
+    void request_page(Proc& p, PageNo page, LocalPage& lp, Access need, int tid);
     void send_complete(const PageMsg& g, int status);
     Status install(Proc& p, PageNo page, LocalPage& lp, const uint8_t* src, bool rw, int phys);
     Status install_from_parked(Proc& p, PageNo page, LocalPage& lp);

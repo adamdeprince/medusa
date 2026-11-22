@@ -257,12 +257,12 @@ Status BodyRunner::spawn(Body& b, const XBeginMsg& x) {
         // Run where the master says it runs, so its view of the CPU is true.
         cpu_set_t* set = CPU_ALLOC(size_t(x.local_cpu) + 1);
         size_t sz = CPU_ALLOC_SIZE(size_t(x.local_cpu) + 1);
-        if (set) {
-            CPU_ZERO_S(sz, set);
-            CPU_SET_S(size_t(x.local_cpu), sz, set);
-            sched_setaffinity(pid, sz, set);
-            CPU_FREE(set);
-        }
+        if (!set) return Status::err(ENOMEM, "allocating CPU affinity mask");
+        CPU_ZERO_S(sz, set);
+        CPU_SET_S(size_t(x.local_cpu), sz, set);
+        int err = sched_setaffinity(pid, sz, set) == 0 ? 0 : errno;
+        CPU_FREE(set);
+        if (err) return Status::err(err, "pinning body to CPU %d", x.local_cpu);
     }
     user_regs_struct regs;
     if (!regs_from_bytes(x.regs, &regs)) return Status::err(EPROTO, "malformed register set");
@@ -302,7 +302,8 @@ void BodyRunner::begin(const XBeginMsg& x) {
     }
     metrics_.add("bodies_started");
     LOG_INFO("export %" PRIu64 ": body pid %d runs home pid %d (%zu mappings)", x.xid, b.pid, x.home_pid, x.vmas.size());
-    to_master_(make_msg(MsgType::XReady, r));
+    uint64_t confirmed_cpu = x.local_cpu >= 0 && x.cpu >= 0 ? uint64_t(x.cpu) + 1 : 0;
+    to_master_(make_msg(MsgType::XReady, r, confirmed_cpu));
     resume(b);
 }
 
@@ -405,9 +406,11 @@ void BodyRunner::go_home(Body& b, XReason reason, int64_t nr, const std::string&
             size_t off = push.data.size();
             push.data.resize(off + kPg);
             if (!mem_read(b.mem.get(), page, push.data.data() + off, kPg).is_ok()) {
-                push.data.resize(off);
-                LOG_ERROR("export %" PRIu64 ": cannot read modified page 0x%" PRIx64, xid, page);
-                continue;
+                XSimpleMsg gone;
+                gone.xid = xid;
+                gone.text = format("cannot recover modified page 0x%" PRIx64, page);
+                to_master_(make_msg(MsgType::XGone, gone));
+                return destroy(xid);
             }
             push.addrs.push_back(page);
             if (push.addrs.size() == 64) flush();
@@ -481,7 +484,8 @@ void BodyRunner::on_uffd(uint64_t xid) {
         uint64_t page = pg(msg.arg.pagefault.address);
         ++b->faults;
         if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-            mark_dirty(*b, page); // first write to a clean page
+            Status st = mark_dirty(*b, page);
+            if (!st.is_ok()) return go_home(*b, XReason::Fault, -1, st.str());
             continue;
         }
         if (b->pages.count(page)) {
@@ -493,13 +497,17 @@ void BodyRunner::on_uffd(uint64_t xid) {
     }
 }
 
-void BodyRunner::mark_dirty(Body& b, uint64_t page) {
+Status BodyRunner::mark_dirty(Body& b, uint64_t page) {
     uffdio_writeprotect wp{};
     wp.range.start = page;
     wp.range.len = kPg;
     wp.mode = 0;
-    ioctl(b.uffd.get(), UFFDIO_WRITEPROTECT, &wp);
+    while (ioctl(b.uffd.get(), UFFDIO_WRITEPROTECT, &wp) < 0) {
+        if (errno == EINTR || errno == EAGAIN) continue;
+        return Status::sys("unprotecting body page 0x%" PRIx64, page);
+    }
     b.pages[page] = 2;
+    return Status::ok();
 }
 
 const XVma* BodyRunner::find_vma(Body& b, uint64_t addr) {
@@ -521,8 +529,11 @@ bool BodyRunner::range_writable(Body& b, uint64_t addr, uint64_t len) {
 }
 
 void BodyRunner::request_page(Body& b, uint64_t page, bool for_write) {
-    for (const auto& [start, count] : b.requested)
-        if (page >= start && page < start + uint64_t(count) * kPg) return;
+    auto next_request = b.requested.upper_bound(page);
+    if (next_request != b.requested.begin()) {
+        auto prev = std::prev(next_request);
+        if (page - prev->first < uint64_t(prev->second.count) * kPg) return;
+    }
     const XVma* v = find_vma(b, page);
     // A fault right after the previous request's last page is a sequential
     // walk: ask for twice as much as last time.
@@ -535,9 +546,7 @@ void BodyRunner::request_page(Body& b, uint64_t page, bool for_write) {
     }
     b.ra_next = page + uint64_t(n) * kPg;
     b.ra_window = std::max(n, kReadahead);
-    b.requested[page] = n;
-    b.req_t0[page] = now_ns();
-    if (for_write) b.req_write[page] = true;
+    b.requested.emplace(page, Body::PageRequest{n, now_ns(), for_write});
     XPageMsg rq;
     rq.xid = b.xid;
     rq.addr = page;
@@ -546,12 +555,12 @@ void BodyRunner::request_page(Body& b, uint64_t page, bool for_write) {
 }
 
 void BodyRunner::on_page(Body& b, const XPageView& p) {
-    b.requested.erase(p.addr);
-    if (auto t = b.req_t0.find(p.addr); t != b.req_t0.end()) {
-        metrics_.observe("body_page_fetch_ns", now_ns() - t->second);
-        b.req_t0.erase(t);
-    }
-    if (p.status != 0 || p.count == 0 || p.len < uint64_t(p.count) * kPg) {
+    auto pending = b.requested.find(p.addr);
+    if (pending == b.requested.end()) return;
+    auto request = pending->second;
+    b.requested.erase(pending);
+    metrics_.observe("body_page_fetch_ns", now_ns() - request.sent_ns);
+    if (p.status != 0 || p.count == 0 || p.count > request.count || p.len != uint64_t(p.count) * kPg) {
         // The address is not valid in the process at home.
         if (b.st == St::AwaitPages) {
             b.have_reply = false;
@@ -559,16 +568,13 @@ void BodyRunner::on_page(Body& b, const XPageView& p) {
         }
         return go_home(b, XReason::Fault, -1, format("invalid memory access at 0x%" PRIx64, p.addr));
     }
-    // A fault caused by a write usually belongs to a run of writes (a buffer
-    // being filled). Installing that batch writable, counted as modified,
-    // saves one write-protect fault per page; the cost is that pages the
-    // body turns out not to write are sent home again unnecessarily.
-    bool written = b.req_write.erase(p.addr) != 0;
+    // Only the faulting instruction requested write access. Neighbouring
+    // pages in the same network reply may remain read-only for the whole run.
     for (uint32_t i = 0; i < p.count; ++i) {
         uint64_t page = p.addr + uint64_t(i) * kPg;
         if (b.pages.count(page)) continue;
         const XVma* v = find_vma(b, page);
-        bool dirty = written && v && (v->prot & kVmWrite);
+        bool dirty = i == 0 && request.write_fault && v && (v->prot & kVmWrite);
         uffdio_copy cp{};
         cp.dst = page;
         cp.src = reinterpret_cast<uint64_t>(p.data + size_t(i) * kPg);
@@ -635,7 +641,6 @@ void BodyRunner::vma_remove(Body& b, uint64_t start, uint64_t end) {
     for (auto it = b.vmas.lower_bound(start); it != b.vmas.end() && it->second.start < end;) it = b.vmas.erase(it);
     for (auto it = b.pages.begin(); it != b.pages.end();) it = (it->first >= start && it->first < end) ? b.pages.erase(it) : std::next(it);
     for (auto it = b.requested.begin(); it != b.requested.end();) it = (it->first >= start && it->first < end) ? b.requested.erase(it) : std::next(it);
-    for (auto it = b.req_write.begin(); it != b.req_write.end();) it = (it->first >= start && it->first < end) ? b.req_write.erase(it) : std::next(it);
 }
 
 // ============================ system calls ============================
@@ -686,7 +691,7 @@ BodyRunner::Step BodyRunner::local_syscall(Body& b, long* ret) {
         }
         return Step::Done;
     }
-    return Step::Done; // sched_yield, futex wake with no possible waiter, advisory madvise: nothing to do
+    return Step::Done; // sched_yield and advisory madvise
 }
 
 // Reading a system-wide clock: answered here, from this machine's clock and
@@ -896,13 +901,16 @@ void BodyRunner::continue_syscall(Body& b) {
 }
 
 BodyRunner::Step BodyRunner::write_out(Body& b, uint64_t addr, const uint8_t* data, size_t len) {
+    // /proc/pid/mem can force a write through a read-only private mapping.
+    // Apply the application's permissions before using it for syscall output.
+    if (!range_writable(b, addr, len)) return Step::Fault;
     Step result = Step::Done;
     for (size_t off = 0; off < len;) {
         uint64_t at = addr + off, page = pg(at);
         size_t chunk = size_t(std::min<uint64_t>(page + kPg - at, len - off));
         auto it = b.pages.find(page);
         if (it != b.pages.end()) {
-            if (it->second != 2) mark_dirty(b, page);
+            if (it->second != 2 && !mark_dirty(b, page).is_ok()) return Step::Fault;
             if (!mem_write(b.mem.get(), at, data + off, chunk).is_ok()) return Step::Fault;
         } else if (chunk == kPg) {
             // The whole page is being replaced: no need to fetch the old one.
@@ -936,7 +944,9 @@ void BodyRunner::apply_reply(Body& b) {
     }
     for (const XVma& v : r.protect) {
         long ret = 0;
-        (void)inject(b, SYS_mprotect, v.start, v.end - v.start, v.prot, 0, 0, 0, &ret);
+        Status st = inject(b, SYS_mprotect, v.start, v.end - v.start, v.prot, 0, 0, 0, &ret);
+        if (!st.is_ok() || ret != 0)
+            return go_home(b, XReason::Error, -1, "cannot mirror memory protection");
         // Keep our own record of protections in step (contents are untouched).
         std::vector<XVma> pieces;
         for (auto it = b.vmas.begin(); it != b.vmas.end(); ++it)
